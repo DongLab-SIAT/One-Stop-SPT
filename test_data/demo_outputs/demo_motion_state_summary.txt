@@ -1,0 +1,5 @@
+Category	Count	Proportion
+Free trajectory	123317	0.81505495740223
+Condensate trajectory	24778	0.16376843204515562
+Condensate to free	1599	0.010568476989272896
+Free to condensate	1605	0.010608133563341463
