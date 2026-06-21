@@ -151,7 +151,7 @@ The demo performs:
 3. **RoC analysis** and CDF visualization.  
 4. **Motion-state classification** of trajectories.
 
-This notebook illustrates the basic analysis pipeline used in the manuscript.
+This notebook illustrates the manuscript workflow using a lightweight CREB demo dataset, because the original 4.1 GB raw TIFF stack exceeds GitHub single-file size limits; numerical outputs such as RoC values and motion-state fractions may therefore differ from the full manuscript analysis.
 ---
 
 ## **7. Project Structure**
@@ -233,10 +233,10 @@ If you use One-Stop SPT for your research, please cite:
 
 ```bibtex
 @article{Liao2025OneStopSPT,
-  title={One-Stop SPT: An Integrated Python Toolkit for End-to-End Analysis of Live-Cell Single-Particle Tracking Data},
+  title={One-Stop SPT: An Integrated Python Toolkit for One-Stop Analysis of Live-Cell Single-Particle Tracking Data},
   author={Liao, Shasha and Yang, Xin and Wang, Jinhong and Zhu, Hongni and Song, Yi and Liu, Yajie and Dong, Peng},
   journal={Bioinformatics},
-  year={2025},
+  year={2026},
 }
 ```
 
