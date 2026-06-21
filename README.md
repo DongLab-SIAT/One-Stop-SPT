@@ -150,8 +150,6 @@ The demo performs:
 2. **Trajectory filtering** based on the nuclear mask.  
 3. **RoC analysis** and CDF visualization.  
 4. **Motion-state classification** of trajectories.
-
-This notebook illustrates the manuscript workflow using a lightweight CREB demo dataset, because the original 4.1 GB raw TIFF stack exceeds GitHub single-file size limits; numerical outputs such as RoC values and motion-state fractions may therefore differ from the full manuscript analysis.
 ---
 
 ## **7. Project Structure**
