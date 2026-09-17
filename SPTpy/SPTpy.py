@@ -10,6 +10,7 @@
 nuclear segmentation的问题已经解决了
 """
 from pathlib import Path
+import tracking_source
 
 # -*- coding: utf-8 -*-
 import torch
@@ -17,7 +18,6 @@ from scipy.ndimage import gaussian_filter1d
 from torch import nn, optim
 from torch.utils.data import DataLoader
 import cv2
-import imageio
 import lmfit
 from PIL.ImageDraw import ImageDraw
 from matplotlib.backends._backend_tk import NavigationToolbar2Tk
@@ -28,6 +28,9 @@ from matplotlib.patches import Polygon, Rectangle
 import glob
 import tkinter as tk
 import time
+import queue
+import threading
+import traceback
 import warnings
 from datetime import datetime
 from tkinter import messagebox, filedialog, Canvas, ttk, simpledialog, \
@@ -40,7 +43,6 @@ from scipy.stats import multivariate_normal, gaussian_kde
 from scipy.optimize import minimize, curve_fit
 from skimage.io import imread
 from PIL import Image, ImageTk, ImageFilter, ImageDraw
-import scipy.io as sio
 import os
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -95,6 +97,7 @@ class SlimFastApp:
             'is_superstack': 0,
             'is_track': 0,
             'frame': 1,
+            'current_frame': 1,
             'view_mode': 'monoView',
             'loc_start': 1,
             'loc_end': float('inf'),
@@ -311,13 +314,11 @@ class SlimFastApp:
                 "file": os.path.basename(path),
                 "Ntraj": n_traj,
                 "counts": {},
-                "percentages": {},
             }
             for cat in CATEGORIES:
                 cnt = counts.get(cat, 0)
-                pct = (cnt * 100.0 / n_traj) if n_traj > 0 else 0.0
                 file_info["counts"][cat] = cnt
-                file_info["percentages"][cat] = pct
+            file_info["percentages"] = self._mt_percentages(file_info["counts"])
 
             per_file_results.append(file_info)
 
@@ -356,18 +357,48 @@ class SlimFastApp:
         return traj_labels
 
     def _mt_classify_traj(self, states: np.ndarray) -> str:
-        """把一条轨迹的布尔 in/out 数组分类为四种情况"""
+        """Classify a trajectory only by its first and last in/out states."""
         if states.size == 0:
-            return 'Other'
-        if states.all():
+            raise ValueError("Cannot classify an empty trajectory.")
+
+        starts_inside = bool(states[0])
+        ends_inside = bool(states[-1])
+        if starts_inside and ends_inside:
             return 'Condensate trajectory'
-        if not states.any():
+        if not starts_inside and not ends_inside:
             return 'Free trajectory'
-        if states[0] and not states[-1]:
+        if starts_inside:
             return 'Condensate to free'
-        if not states[0] and states[-1]:
-            return 'Free to condensate'
-        return 'Other'
+        return 'Free to condensate'
+
+    def _mt_percentages(self, counts):
+        """Return one-decimal percentages whose displayed sum is exactly 100.0."""
+        total = sum(counts.get(category, 0) for category in CATEGORIES)
+        if total == 0:
+            return {category: 0.0 for category in CATEGORIES}
+
+        total_units = 1000  # tenths of one percent in 100.0%
+        exact_units = {
+            category: counts.get(category, 0) * total_units / total
+            for category in CATEGORIES
+        }
+        rounded_units = {
+            category: math.floor(exact_units[category])
+            for category in CATEGORIES
+        }
+        units_left = total_units - sum(rounded_units.values())
+        remainder_order = sorted(
+            CATEGORIES,
+            key=lambda category: exact_units[category] - rounded_units[category],
+            reverse=True,
+        )
+        for category in remainder_order[:units_left]:
+            rounded_units[category] += 1
+
+        return {
+            category: rounded_units[category] / 10.0
+            for category in CATEGORIES
+        }
 
     def show_motion_results_window(self, per_file_results, global_counter):
         """在新窗口显示每个文件和全局的分类比例"""
@@ -386,26 +417,30 @@ class SlimFastApp:
         text.configure(yscrollcommand=scrollbar.set)
 
         # ----- 全局汇总 -----
-        total = sum(global_counter[c] for c in CATEGORIES) or 1
+        total = sum(global_counter[c] for c in CATEGORIES)
+        global_percentages = self._mt_percentages(global_counter)
 
         text.insert("end", "=== Global summary (all files) ===\n")
         text.insert("end", f"{'Category':<25s} {'%':>7s} {'(n)':>8s}\n")
         for cat in CATEGORIES:
             n = global_counter[cat]
-            pct = n * 100.0 / total
+            pct = global_percentages[cat]
             text.insert("end", f"{cat:<25s} {pct:6.1f}% {n:8d}\n")
+        text.insert("end", f"{'Total':<25s} {100.0 if total else 0.0:6.1f}% {total:8d}\n")
 
         text.insert("end", "\n=== Per file results ===\n")
         for info in per_file_results:
             text.insert("end", f"\n{info['file']}  (N = {info['Ntraj']})\n")
 
-            # 用“非 Other 的总数”做分母，跟全局一致
-            total_valid = sum(info["counts"][cat] for cat in CATEGORIES) or 1
-
             for cat in CATEGORIES:
                 cnt = info["counts"][cat]
-                pct = cnt * 100.0 / total_valid
+                pct = info["percentages"][cat]
                 text.insert("end", f"  {cat:<25s} {pct:6.1f}% ({cnt:4d})\n")
+            total_file = sum(info["counts"][cat] for cat in CATEGORIES)
+            text.insert(
+                "end",
+                f"  {'Total':<25s} {100.0 if total_file else 0.0:6.1f}% ({total_file:4d})\n"
+            )
 
         text.config(state="disabled")
 
@@ -419,7 +454,7 @@ class SlimFastApp:
         param_win.title("RoC Parameters")
 
         # Acquisition time & pixel size
-        acq_time_var = tk.StringVar(value="10")  # seconds
+        acq_time_var = tk.StringVar(value="0.01")  # seconds: 10 ms CREB acquisition
         pixel_size_var = tk.StringVar(value="0.109")  # µm/px (109 nm)
 
         row = 0
@@ -784,28 +819,90 @@ class SlimFastApp:
         if hasattr(self, "delta_export_dict"):
             self.delta_export_dict[label] = delta.copy()
 
+    def _load_spoton_tracking_file(self, filename):
+        """Load and validate a Spot-On trajectory table as x, y, frame, track_id."""
+        path = Path(filename)
+        header_line = None
+        first_content = None
+        with path.open('r', encoding='utf-8-sig', errors='replace') as handle:
+            for line_number, line in enumerate(handle, start=1):
+                stripped = line.strip()
+                if stripped and not stripped.startswith('#'):
+                    header_line = line_number
+                    first_content = stripped
+                    break
+
+        if first_content is None:
+            raise ValueError("The file is empty.")
+
+        first_fields = [field.strip() for field in first_content.split('\t')]
+        if len(first_fields) < 4:
+            raise ValueError(
+                "Expected at least four tab-separated columns: x, y, frame, track_id."
+            )
+
+        try:
+            [float(value) for value in first_fields[:4]]
+            skip_header = 0
+        except ValueError:
+            normalized = [value.lower().replace(' ', '_') for value in first_fields[:4]]
+            if normalized != ['x', 'y', 'frame', 'track_id']:
+                raise ValueError(
+                    "This is not a trajectory table. Expected the first four columns "
+                    "to be x, y, frame, track_id. Localization (*_locs.txt) and RC "
+                    "files cannot be used here."
+                )
+            skip_header = header_line
+
+        try:
+            data = np.genfromtxt(
+                path,
+                delimiter='\t',
+                usecols=(0, 1, 2, 3),
+                comments='#',
+                skip_header=skip_header,
+                invalid_raise=True
+            )
+        except (ValueError, OSError) as exc:
+            raise ValueError(f"Could not read the trajectory columns: {exc}") from exc
+
+        if np.size(data) == 0:
+            raise ValueError("The trajectory table contains no data rows.")
+        data = np.asarray(data, dtype=float)
+        if data.ndim == 1:
+            data = data[np.newaxis, :]
+
+        invalid_rows = np.flatnonzero(~np.isfinite(data).all(axis=1))
+        if invalid_rows.size:
+            row_number = int(invalid_rows[0]) + skip_header + 1
+            raise ValueError(f"Row {row_number} contains an empty or non-numeric value.")
+
+        for column, name in ((2, 'frame'), (3, 'track_id')):
+            non_integer = np.flatnonzero(~np.isclose(data[:, column], np.rint(data[:, column])))
+            if non_integer.size:
+                row_number = int(non_integer[0]) + skip_header + 1
+                raise ValueError(f"Row {row_number} has a non-integer {name} value.")
+
+        return data
+
     def load_spoton_core(self):
         # 1) 选择跟踪文件
         fnames = filedialog.askopenfilenames(
-            title="选择 TXT 追踪文件",
+            title="Select trajectory TXT (x, y, frame, track_id)",
             filetypes=[("Text files", "*.txt")]
         )
+        if not fnames:
+            return
         # 2) 读取原始数据 [x, y, frame, track_id]
         all_raw = []
         for fname in fnames:
             try:
-                data = np.genfromtxt(
-                    fname,
-                    delimiter='\t',
-                    usecols=(0, 1, 2, 3),
-                    comments='#',  # 跳过以 # 开头的注释
-                    invalid_raise=False
-                )
-                if data.ndim == 1:
-                    data = data[np.newaxis, :]  # 保证至少二维
-                all_raw.append(data)
+                all_raw.append(self._load_spoton_tracking_file(fname))
             except Exception as e:
-                messagebox.showerror("Error", f"Failed to load {os.path.basename(fname)}: {e}")
+                messagebox.showerror(
+                    "Invalid tracking file",
+                    f"Cannot load {os.path.basename(fname)}:\n\n{e}"
+                )
                 return
 
         # 3) 弹出参数设置窗口
@@ -816,7 +913,7 @@ class SlimFastApp:
         var_fr = tk.DoubleVar(value=10.0)  # 帧间隔(毫秒)
         var_px = tk.DoubleVar(value=109.0)  # 像素大小(nm/px)
         var_binwidth = tk.DoubleVar(value=0.010)
-        var_timepoints = tk.IntVar(value=50)
+        var_timepoints = tk.IntVar(value=8)
         var_jumps = tk.IntVar(value=4)
         var_use_entire = tk.BooleanVar(value=False)
         var_maxjump = tk.DoubleVar(value=3)
@@ -867,7 +964,7 @@ class SlimFastApp:
                 fr_ms = float(ent_fr.get())
                 px_nm = float(ent_px.get())
             except ValueError:
-                messagebox.showerror("输入错误", "帧间隔和像素大小都必须是数字。")
+                messagebox.showerror("Input Error", "Frame interval and pixel size must be numbers.")
                 return
 
             # 2) 隐藏前两行和 Confirm 按钮
@@ -985,7 +1082,6 @@ class SlimFastApp:
             row_bw = tk.Frame(jld_panel)
             row_bw.pack(fill='x', padx=5, pady=2)
             tk.Label(row_bw, text="Bin width (µm):").pack(side='left')
-            var_binwidth = tk.DoubleVar(value=0.010)
             tk.Spinbox(
                 row_bw,
                 from_=0.0, to=10.0, increment=0.001,
@@ -998,7 +1094,6 @@ class SlimFastApp:
             row_nt = tk.Frame(jld_panel)
             row_nt.pack(fill='x', padx=5, pady=2)
             tk.Label(row_nt, text="Number of timepoints:").pack(side='left')
-            var_timepoints = tk.IntVar(value=8)
             tk.Spinbox(
                 row_nt,
                 from_=1, to=100, increment=1,
@@ -1010,7 +1105,6 @@ class SlimFastApp:
             row_jc = tk.Frame(jld_panel)
             row_jc.pack(fill='x', padx=5, pady=2)
             tk.Label(row_jc, text="Jumps to consider:").pack(side='left')
-            var_jumps = tk.IntVar(value=4)
             tk.Spinbox(
                 row_jc,
                 from_=1, to=100, increment=1,
@@ -1021,7 +1115,6 @@ class SlimFastApp:
             # Use entire trajectories?
             row_entire = tk.Frame(jld_panel)
             row_entire.pack(fill='x', padx=5, pady=2)
-            var_use_entire = tk.BooleanVar(value=False)
             tk.Checkbutton(
                 row_entire,
                 text="Use entire trajectories?",
@@ -1032,7 +1125,6 @@ class SlimFastApp:
             row_mj = tk.Frame(jld_panel)
             row_mj.pack(fill='x', padx=5, pady=2)
             tk.Label(row_mj, text="Max jump (µm):").pack(side='left')
-            var_maxjump = tk.DoubleVar(value=3)
             tk.Spinbox(
                 row_mj,
                 from_=0.0, to=10.0, increment=0.010,
@@ -1168,10 +1260,24 @@ class SlimFastApp:
             # --- Localization error and fitting options ---
             row = tk.Frame(mf_panel)
             row.pack(fill='x', padx=5, pady=2)
-            tk.Checkbutton(row, text="Fit localization error", variable=var_fit_error).pack(side='left')
-            tk.Spinbox(row, from_=0.0, to=1.0, increment=0.001, textvariable=var_error,
-                       format="%.3f", width=8, state=('normal' if not var_fit_error.get() else 'disabled')
-                       ).pack(side='left', padx=(5, 0))
+            error_spinbox = tk.Spinbox(
+                row, from_=0.0, to=1.0, increment=0.001,
+                textvariable=var_error, format="%.3f", width=8
+            )
+
+            def _sync_localization_error_state():
+                error_spinbox.configure(
+                    state='disabled' if var_fit_error.get() else 'normal'
+                )
+
+            tk.Checkbutton(
+                row,
+                text="Fit localization error",
+                variable=var_fit_error,
+                command=_sync_localization_error_state
+            ).pack(side='left')
+            error_spinbox.pack(side='left', padx=(5, 0))
+            _sync_localization_error_state()
 
             row = tk.Frame(mf_panel)
             row.pack(fill='x', padx=5, pady=2)
@@ -1197,15 +1303,41 @@ class SlimFastApp:
 
         confirm_btn.configure(command=_on_confirm)
 
-        def _on_fit():
+        def _on_fit(raw_override=None, result_context=None, scope_label=None):
+            if raw_override is None:
+                fit_groups = self._spoton_fit_groups(all_raw, fnames, var_single.get())
+                if len(fit_groups) > 1:
+                    plot_win = tk.Toplevel(self.master)
+                    plot_win.title("Tracking Analysis — Single-cell fits")
+                    notebook = ttk.Notebook(plot_win)
+                    notebook.pack(fill='both', expand=True, padx=5, pady=5)
+                    plot_win.update_idletasks()
+
+                    for group, group_label in fit_groups:
+                        _on_fit(
+                            raw_override=group,
+                            result_context=(plot_win, notebook),
+                            scope_label=group_label
+                        )
+                        plot_win.update_idletasks()
+                    return
+
+                analysis_raw, default_label = fit_groups[0]
+                if scope_label is None:
+                    scope_label = default_label
+            else:
+                analysis_raw = raw_override
+                if scope_label is None:
+                    scope_label = "Selected dataset"
+
             t0 = time.perf_counter()  # <--- 计时起点：按下按钮即开始
-            print("[INFO] Tracking analysis started ...")
+            print(f"[INFO] Tracking analysis started: {scope_label} ...")
             # 1) 读取参数并校验
             try:
                 fr_ms = float(ent_fr.get())
                 px_nm = float(ent_px.get())
             except ValueError:
-                messagebox.showerror("输入错误", "帧间隔和像素大小都必须是数字。")
+                messagebox.showerror("Input Error", "Frame interval and pixel size must be numbers.")
                 return
 
             # --- 全局统计参数初始化 ---
@@ -1218,7 +1350,7 @@ class SlimFastApp:
             particles_per_frame = []  # 存放每个帧的粒子数量
             longest_gaps = []  # 存放每条轨迹的最长帧间隙
 
-            for arr in all_raw:
+            for arr in analysis_raw:
                 # 1) 缩放坐标 & 基本累加
                 data = arr.copy()
                 data[:, 0] *= px_nm
@@ -1269,52 +1401,9 @@ class SlimFastApp:
                         dist = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
                         jump_lengths.append(dist)
 
-            # --- 7) 计算每条轨迹的 MSD 并拟合限域 RoC 模型 ---
-            msd_fits = []  # 用于存放 (样本索引, track_id, popt)
-            for sample_idx, arr in enumerate(all_raw):
-                # 先复制并做单位换算：像素坐标 × px_nm → nm，再 ÷1000 → µm
-                data = arr.copy()
-                data[:, 0] = data[:, 0] * px_nm / 1000.0  # x (µm)
-                data[:, 1] = data[:, 1] * px_nm / 1000.0  # y (µm)
-                # 按轨迹 ID 分组
-                td = defaultdict(list)
-                for x_nm, y_nm, frame, tid in data:
-                    td[int(tid)].append((x_nm, y_nm, int(frame)))
-
-                for track_id, pts in td.items():
-                    pts = np.array(pts, dtype=float)
-                    # 将 x,y 从 nm 转为 µm
-                    xy = pts[:, :2] * 1e-3
-                    frames = pts[:, 2].astype(int)
-                    L = len(frames)
-                    if L < 2:
-                        continue
-
-                    # 计算滞后时间 (秒) 和对应的 MSD(τ)
-                    lags = np.arange(1, L)
-                    t = lags * (fr_ms / 1000.0)  # fr_ms 单位 ms → 秒
-                    msd = np.array([
-                        np.mean(np.sum((xy[lag:] - xy[:-lag]) ** 2, axis=1))
-                        for lag in lags
-                    ])
-
-                    # 拟合限域模型：msd_confined(t; Rc, D, sigma)
-                    try:
-                        # 初始猜测：Rc ~ sqrt(max(msd)), D ~ 0.1, sigma ~ sqrt(msd[0])/2
-                        p0 = [np.sqrt(np.max(msd)), 0.1, np.sqrt(msd[0]) / 2]
-                        popt, _ = curve_fit(
-                            self.msd_confined, t, msd, p0=p0,
-                            bounds=([0, 0, 0], [np.inf, np.inf, np.inf])
-                        )
-                    except Exception:
-                        popt = [np.nan, np.nan, np.nan]
-
-                    msd_fits.append((sample_idx, track_id, popt))
-
-            # msd_fits 中现在包含每条轨迹对应的 (Rc, D, σ)
-            # --- 8) 构造 trackedPar 以进行跳距分析 ---
+            # --- 7) 构造 trackedPar 以进行跳距分析 ---
             trackedPar = []
-            for arr in all_raw:
+            for arr in analysis_raw:
                 data = arr.copy()
                 data[:, 0] = data[:, 0] * px_nm / 1000.0  # x (µm)
                 data[:, 1] = data[:, 1] * px_nm / 1000.0  # y (µm)
@@ -1341,9 +1430,10 @@ class SlimFastApp:
 
             # （b）直接调用完整版 compute_jump_length_distribution，
             #     同时拿到 PDF 与（可选的）CDF
-            if var_model_fit.get() == "CDF":
-                # CDF 模式：直接让函数帮我们生成细化后的 CDF 网格和 JumpProbCDF
-               data=self.compute_jump_length_distribution(
+            try:
+                if var_model_fit.get() == "CDF":
+                    # CDF 模式：直接让函数帮我们生成细化后的 CDF 网格和 JumpProbCDF
+                    data = self.compute_jump_length_distribution(
                         trackedPar,
                         CDF=True,
                         useEntireTraj=var_use_entire.get(),
@@ -1353,13 +1443,13 @@ class SlimFastApp:
                         MaxJump=var_maxjump.get(),
                         BinWidth=var_binwidth.get()
                     )
-               HistVecJumps = data[2]
-               JumpProb = data[3]
-               HistVecJumpsCDF = data[0]
-               JumpProbCDF = data[1]
-            else:
-                # PDF 模式：只需要 PDF，自己再去累加算 CDF
-                data = self.compute_jump_length_distribution(
+                    HistVecJumps = data[2]
+                    JumpProb = data[3]
+                    HistVecJumpsCDF = data[0]
+                    JumpProbCDF = data[1]
+                else:
+                    # PDF 模式：只需要 PDF，自己再去累加算 CDF
+                    data = self.compute_jump_length_distribution(
                         trackedPar,
                         CDF=False,
                         useEntireTraj=var_use_entire.get(),
@@ -1369,10 +1459,13 @@ class SlimFastApp:
                         MaxJump=var_maxjump.get(),
                         BinWidth=var_binwidth.get()
                     )
-                HistVecJumps = data[0]
-                JumpProb = data[1]
-                HistVecJumpsCDF = data[0]
-                JumpProbCDF = data[1]
+                    HistVecJumps = data[0]
+                    JumpProb = data[1]
+                    HistVecJumpsCDF = data[0]
+                    JumpProbCDF = data[1]
+            except ValueError as exc:
+                messagebox.showerror("Jump-length error", str(exc))
+                return
 
 
             # —— 9.2 并行提交拟合 —— #
@@ -1380,12 +1473,11 @@ class SlimFastApp:
             # 下面的 a,b 还是保存在 image_bin 里的
             dZ = var_dz.get()
             gaps_allowed = 1
+            zcorr = bool(var_zcorr.get())
 
-            # —— 先查找到最匹配的 a, b —— #
-            Z_corr_a, Z_corr_b, matched_dT, matched_dZ = self.match_z_corr_coeff(
-                dT, dZ,
-                gaps_allowed=gaps_allowed,
-                # mat_path="MonteCarloParams_1_gap.mat"  # .mat 所在目录
+            # Only load the Monte Carlo table when Z correction is enabled.
+            Z_corr_a, Z_corr_b = self._get_z_correction_parameters(
+                dT, dZ, enabled=zcorr, gaps_allowed=gaps_allowed
             )
 
             # 从“Model fitting”面板读所有参数：
@@ -1405,28 +1497,32 @@ class SlimFastApp:
 
             use_error = var_fit_error.get()  # True/False是否启用fit localization error
             error_val = var_error.get()   #####fit localization error 0.035
-            zcorr = var_zcorr.get() ###0.7
+            try:
+                loc_error, fit_sigma, sigma_lb, sigma_ub = \
+                    self._spoton_localization_error_options(use_error, error_val)
+            except ValueError as exc:
+                messagebox.showerror("Input Error", str(exc))
+                return
             fit_mode = 1 if var_model_fit.get() == "PDF" else 2
             iterations = var_iters.get()
 
             # 构造上下限列表：
             if states == 2:
-                sigma_bound = [0.01, 0.075]
-                LB = [df_min, db_min, fbound_min,sigma_bound[0]]
-                UB = [df_max, db_max, fbound_max,sigma_bound[1]]
+                LB = [df_min, db_min, fbound_min] + sigma_lb
+                UB = [df_max, db_max, fbound_max] + sigma_ub
                 params = {
                           'UB': UB,
                           'LB': LB,
-                          'LocError': None,  # Manually input the localization error in um: 35 nm = 0.035 um.
+                          'LocError': loc_error,
                           'iterations': iterations,  # Manually input the desired number of fitting iterations:
                           'dT': dT,  # Time between frames in seconds
                           'dZ': dZ,  # The axial illumination slice: measured to be roughly 700 nm
                           'ModelFit': fit_mode,
                           'fit2states': True,
-                          'fitSigma': True,
+                          'fitSigma': fit_sigma,
                           'a': Z_corr_a,
                           'b': Z_corr_b,
-                          'useZcorr': True
+                          'useZcorr': zcorr
                           }
 
 
@@ -1441,24 +1537,22 @@ class SlimFastApp:
                 ## Normalization does not work for PDF yet (see commented line in fastspt.py)
                 if True:
                     y *= float(len(HistVecJumpsCDF)) / float(len(HistVecJumps))
-                    fig_jump_1 = plt.figure(figsize=(10, 5))  # Initialize the plot
                     # self.plot_histogram(HistVecJumps, JumpProb)  ## Read the documentation of this function to learn how to populate
             else:
-                sigma_bound = [0.01, 0.075]
-                LB = [dfast_min, ds_min, db_min, ffast_min,fbound_min, sigma_bound[0]]
-                UB = [dfast_max, ds_max, db_max, ffast_max,fbound_max, sigma_bound[1]]
+                LB = [dfast_min, ds_min, db_min, ffast_min, fbound_min] + sigma_lb
+                UB = [dfast_max, ds_max, db_max, ffast_max, fbound_max] + sigma_ub
                 params = {'UB': UB,
                           'LB': LB,
-                          'LocError': None if use_error else error_val,  # Manually input the localization error in um: 35 nm = 0.035 um.
+                          'LocError': loc_error,
                           'iterations': iterations,  # Manually input the desired number of fitting iterations:
                           'dT': dT,  # Time between frames in seconds
                           'dZ': dZ,  # The axial illumination slice: measured to be roughly 700 nm
                           'ModelFit': fit_mode,
                           'fit2states': False,
-                          'fitSigma': True,
+                          'fitSigma': fit_sigma,
                           'a': Z_corr_a,
                           'b': Z_corr_b,
-                          'useZcorr': True,
+                          'useZcorr': zcorr,
                           # （可选）放宽 solver precision，使结果和 MATLAB 默认更接近
                           'solverparams': {'ftol': 1e-8, 'xtol': 1e-8, 'maxfev': 100000},
                           }
@@ -1478,18 +1572,17 @@ class SlimFastApp:
                     norm_y[i, :] = y[i, :] / y[i, :].sum()
                 scaled_y = (float(len(HistVecJumpsCDF)) / len(
                     HistVecJumps)) * norm_y  # scale y for plotting next to histograms
-                fig_jump_2 = plt.figure(figsize=(10, 5))  # Initialize the plot
 
             # 回调只画一幅
-            def _draw_fit_one(fit):
+            def _draw_fit_one(fit, result_parent):
                 # —— 1) 先生成参数统计区 —— #
-                hist_frame = tk.LabelFrame(plot_win, text="Jump length histograms")
-                hist_frame.pack(fill='x', padx=5, pady=(5, 0))
+                hist_frame = tk.LabelFrame(result_parent, text="Jump length histograms")
+                hist_frame.pack(side='bottom', fill='x', padx=5, pady=(5, 0))
 
                 # 左半列
                 col1 = tk.Frame(hist_frame)
                 col1.pack(side='left', fill='both', expand=True, padx=(5, 2), pady=5)
-                tk.Label(col1, text="Fit parameters for cell 1.").pack(anchor='w')
+                tk.Label(col1, text=f"Fit parameters for {scope_label}.").pack(anchor='w')
 
                 vals = fit.params
                 lines1 = [
@@ -1510,21 +1603,23 @@ class SlimFastApp:
                         f"F_fast  : {vals['F_fast'].value:.3f} ± {vals['F_fast'].stderr or 0:.3f}",
                     ]
                 # 通用项
+                sigma = vals['sigma']
+                if use_error:
+                    sigma_text = (
+                        f"Localization error : {sigma.value:.3f} ± "
+                        f"{sigma.stderr or 0:.3f} µm (fitted)"
+                    )
+                else:
+                    sigma_text = f"Localization error : {sigma.value:.3f} µm (fixed)"
                 lines1 += [
+                    sigma_text,
                     f"l₂ error: {fit.params.ssq2:.6f}",
                     f"AIC: {fit.aic:.2f}, BIC: {fit.bic:.2f}",
                 ]
                 for txt in lines1:
                     tk.Label(col1, text=f"- {txt}", anchor='w').pack(anchor='w')
 
-                # 右半列
-                col2 = tk.Frame(hist_frame)
-                col2.pack(side='left', fill='both', expand=True, padx=(2, 5), pady=5)
-                tk.Label(col2, text="Global fit parameters for cells [1].").pack(anchor='w')
-                for txt in lines1:
-                    tk.Label(col2, text=f"- {txt}", anchor='w').pack(anchor='w')
-
-                # 设置标题并根据 states 值和 len(all_raw) 决定调用的参数
+                # 设置标题并根据 states 值决定调用的参数
                 if states == 2:
                     title = "2-State Fit"
                     y_to_use =  y
@@ -1534,7 +1629,8 @@ class SlimFastApp:
 
                 fig=self.plot_histogram(
                     HistVecJumps=HistVecJumps, emp_hist=JumpProb, HistVecJumpsCDF=HistVecJumpsCDF,
-                    sim_hist=y_to_use  # 根据条件选择 y_m, y, y_n 或 scaled_y
+                    sim_hist=y_to_use,  # 根据条件选择 y_m, y, y_n 或 scaled_y
+                    TimeGap=fr_ms
                 )
                 return fig
 
@@ -1543,76 +1639,19 @@ class SlimFastApp:
             print(f"[INFO] Tracking analysis completed in {elapsed:.2f} seconds.")
 
             # —— 弹窗 + Notebook 三标签页 —— #
-            plot_win = tk.Toplevel(self.master)
-            plot_win.title("Tracking Analysis")
+            if result_context is None:
+                plot_win = tk.Toplevel(self.master)
+                plot_win.title("Tracking Analysis")
+                notebook = ttk.Notebook(plot_win)
+                notebook.pack(fill='both', expand=True, padx=5, pady=5)
+            else:
+                plot_win, notebook = result_context
 
-            notebook = ttk.Notebook(plot_win)
-            notebook.pack(fill='both', expand=True, padx=5, pady=5)
-
-            fig =_draw_fit_one(fit)  # 直接绘制拟合结果，而不需要回调
-
-            # —— 在绘图前，先重建 tracks 列表 —— #
-            # tracks 中每个元素是一个形状为 (N,3) 的 ndarray，列依次是 [x(µm), y(µm), frame]
-            tracks = []
-            px_um = px_nm / 1000.0  # 先把像素单位从 nm 转成 µm
-            for arr in all_raw:
-                data = arr.copy()
-                # 前面你已经对 data 进行了单位转换，这里如果没做就再做一次：
-                data[:, 0] *= px_um
-                data[:, 1] *= px_um
-
-                td = defaultdict(list)
-                for x, y, frame, tid in data:
-                    td[int(tid)].append((x, y, int(frame)))
-
-                for pts in td.values():
-                    pts = np.array(pts, dtype=float)  # shape=(N,3)
-                    tracks.append(pts)
-
-            # —— 绘制限域 MSD 拟合图 —— #
-            # 只对轨迹长度 >=5 的轨迹进行示例
-            valid_tracks = [tr for tr in tracks if len(tr) >= 5]
-            if not valid_tracks:
-                valid_tracks = tracks
-            example_idx = len(valid_tracks) // 2
-            msd_ex = self.compute_msd(valid_tracks[example_idx])
-            t_ex = np.arange(1, len(msd_ex) + 1) * (fr_ms / 1000.0)
-            popt_ex, _ = curve_fit(
-                self.msd_confined,
-                t_ex, msd_ex,
-                p0=[np.sqrt(msd_ex[-1]), 0.1, 0.03],
-                bounds=([0, 0, 0], [np.inf, np.inf, np.inf])
-            )
-            fig_confined = plt.figure(figsize=(5, 4))
-            ax = fig_confined.add_subplot(111)
-            ax.scatter(t_ex, msd_ex, label="MSD data")
-            ax.plot(t_ex, self.msd_confined(t_ex, *popt_ex), 'r-', label=f"Rc={popt_ex[0]:.2f} μm")
-            ax.set_xlabel("Δt (s)")
-            ax.set_ylabel("MSD (μm²)")
-            ax.legend()
-            # 取消坐标轴偏移，使用普通数字
-            ax.ticklabel_format(useOffset=False, style='plain')
-
-            # —— 先定义 popts —— #
-            popts = [popt for (_, _, popt) in msd_fits]
-            # —— 绘制 RoC 分布直方图 —— #
-            Rc_vals = [p[0] for p in popts  # p[0] 就是 Rc
-                       if p is not None and not np.isnan(p[0])]
-            mean_Rc = np.mean(Rc_vals) if Rc_vals else 0
-            std_Rc = np.std(Rc_vals) if Rc_vals else 0
-            fig_roc = plt.figure(figsize=(5, 4))
-            axr = fig_roc.add_subplot(111)
-            axr.hist(Rc_vals, bins=20, density=True)
-            axr.set_xlabel("RoC (μm)")
-            axr.set_ylabel("Density")
-            axr.set_title(f"RoC Distribution")
-
-            # Tab1: 跳距分布
             tab1 = ttk.Frame(notebook)
-            notebook.add(tab1, text="Jump-length")
+            tab_title = scope_label.split(':', 1)[0] if var_single.get() else "Jump-length"
+            notebook.add(tab1, text=tab_title)
 
-            # # 根据states值选择不同的fig对象
-            fig = fig_jump_1 if states == 2 else fig_jump_2
+            fig = _draw_fit_one(fit, tab1)
 
             canvas1 = FigureCanvasTkAgg(fig, master=tab1)
             canvas1.draw()
@@ -1626,42 +1665,46 @@ class SlimFastApp:
                     filetypes=[("PNG 图像", "*.png"),
                                ("TIFF 图像", "*.tif"),
                                ("JPEG 图像", "*.jpg")],
-                    title="保存当前图像"
+                    title="Save Current Image"
                 )
                 if not fn:
                     return
                 try:
                     # dpi=300, bbox_inches='tight' 去掉周围多余空白
                     fig.savefig(fn, dpi=300, bbox_inches='tight')
-                    messagebox.showinfo("保存成功", f"图像已保存到：\n{fn}")
+                    messagebox.showinfo("Saved", f"Image saved to:\n{fn}")
                 except Exception as e:
-                    messagebox.showerror("保存失败", str(e))
+                    messagebox.showerror("Save failed", str(e))
 
             # 放一个按钮到 tab1 底部
             btn_save = ttk.Button(tab1, text="save", command=save_current_figure)
             btn_save.pack(side='bottom', anchor='center', padx=10, pady=5)
 
+    def _spoton_fit_groups(self, datasets, filenames, single_cell):
+        """Group selected tracking files for pooled or per-file Spot-On fits."""
+        if not datasets:
+            raise ValueError("No tracking datasets are loaded.")
+        if len(datasets) != len(filenames):
+            raise ValueError("Tracking datasets and filenames are inconsistent.")
 
-            # # Tab2: 限域 MSD
-            # tab2 = ttk.Frame(notebook)
-            # notebook.add(tab2, text="Confined MSD")
-            # canvas2 = FigureCanvasTkAgg(fig_confined, master=tab2)
-            # canvas2.draw()
-            # canvas2.get_tk_widget().pack(fill='both', expand=True, padx=5, pady=5)
-            #
-            # # Tab3: RoC 分布 & 统计
-            # tab3 = ttk.Frame(notebook)
-            # notebook.add(tab3, text="RoC Distribution")
-            # canvas3 = FigureCanvasTkAgg(fig_roc, master=tab3)
-            # canvas3.draw()
-            # canvas3.get_tk_widget().pack(fill='both', expand=True, padx=5, pady=5)
+        if single_cell:
+            return [
+                ([dataset], f"Cell {index}: {os.path.basename(filename)}")
+                for index, (dataset, filename) in enumerate(
+                    zip(datasets, filenames), start=1
+                )
+            ]
+        return [(list(datasets), f"Pooled fit ({len(datasets)} dataset(s))")]
 
-            # # 添加平均值和标准差文本
-            # stats = ttk.Frame(tab3)
-            # stats.pack(fill='x', pady=(5, 0))
-            # ttk.Label(stats, text=f"Average RoC: {mean_Rc:.4f} μm").pack(side='left', padx=8)
-            # ttk.Label(stats, text=f"Std Dev: {std_Rc:.4f} μm").pack(side='left')
+    def _spoton_localization_error_options(self, fit_error, error_value):
+        """Return sigma settings for fitted or fixed localization error."""
+        if fit_error:
+            return None, True, [0.01], [0.075]
 
+        error_value = float(error_value)
+        if not np.isfinite(error_value) or error_value < 0:
+            raise ValueError("Localization error must be a non-negative number.")
+        return error_value, False, [], []
 
     def compute_msd(self,track):
         # track: numpy 数组，shape=(N_frames, >=3)，列为 [x, y, frame, ...]
@@ -1704,10 +1747,13 @@ class SlimFastApp:
         matched_dZ : float
         """
         # 1) 选择 .mat 文件
-        if mat_path is None:
-            mat_path = ''  # 默认当前目录
         if gaps_allowed == 1:
-            fname = f"{mat_path}MonteCarloParams_1_gap.mat"
+            if mat_path is None:
+                # Resolve from the source file, independently of the directory
+                # used to launch Python or PyCharm.
+                fname = Path(__file__).resolve().with_name('MonteCarloParams_1_gap.mat')
+            else:
+                fname = Path(mat_path).expanduser() / 'MonteCarloParams_1_gap.mat'
         else:
             raise ValueError(f"GapsAllowed = {gaps_allowed} not supported.")
 
@@ -1741,6 +1787,15 @@ class SlimFastApp:
         print("===== done =====\n")
 
         return Z_corr_a, Z_corr_b, matched_dT, matched_dZ
+
+    def _get_z_correction_parameters(self, dT, dZ, enabled, gaps_allowed=1):
+        """Return calibration coefficients only when Z correction is enabled."""
+        if not enabled:
+            return 0.0, 0.0
+        a, b, _, _ = self.match_z_corr_coeff(
+            dT, dZ, gaps_allowed=gaps_allowed
+        )
+        return a, b
 
     def generate_jump_length_distribution(self,fitparams, JumpProb, r,
                                           LocError, dT, dZ, a, b, fit2states=True,
@@ -1863,11 +1918,11 @@ class SlimFastApp:
                 # multiple timepoints.
 
                 # Figure out what the max jump to consider is:
-                HowManyFrames = min(TimePoints - 1, CurrTrajLength)
+                HowManyFrames = min(TimePoints - 1, CurrTrajLength - 1)
                 if CurrTrajLength > 1:
                     CellJumps = CellJumps + CurrTrajLength - 1  # for counting all the jumps
                     for n in range(1, HowManyFrames + 1):  # 1:HowManyFrames
-                        for k in range(CurrTrajLength - (n + 1)):  # =1:CurrTrajLength-n
+                        for k in range(CurrTrajLength - n):  # =1:CurrTrajLength-n
                             # Find the current XY coordinate and frames between
                             # timepoints
                             CurrXY_points = np.vstack((trackedPar[i][0][k, :],
@@ -1878,7 +1933,8 @@ class SlimFastApp:
                             # trackedPar(i).Frame(k+n) - trackedPar(i).Frame(k);
 
                             # Calculate the distance between the pair of points
-                            TransLengths[CurrFrameJump - 1]["Step"].append(self.pdist(CurrXY_points))
+                            if 0 < CurrFrameJump <= len(TransLengths):
+                                TransLengths[CurrFrameJump - 1]["Step"].append(self.pdist(CurrXY_points))
 
         elif not useAllTraj:  ## Use only the first JumpsToConsider timepoints
             for i in range(len(trackedPar)):  # 1:length(trackedPar)
@@ -1891,7 +1947,7 @@ class SlimFastApp:
                 # how many jumps you can consider.
 
                 # Figure out what the max jump to consider is:
-                HowManyFrames = min([TimePoints - 1, CurrTrajLength])
+                HowManyFrames = min([TimePoints - 1, CurrTrajLength - 1])
                 if CurrTrajLength > 1:
                     CellJumps = CellJumps + CurrTrajLength - 1  # for counting all the jumps
                     for n in range(1, HowManyFrames + 1):  # 1:HowManyFrames
@@ -1914,6 +1970,17 @@ class SlimFastApp:
                                 # 这里的调试日志可以根据需要开启，如果数据量太大建议保持 pass
                                 # print(f"[DEBUG] Jump size {CurrFrameJump} out of range (max: {len(TransLengths)}). Skipping...")
                                 pass
+        empty_lags = [
+            lag + 1 for lag in range(TimePoints - 1)
+            if not TransLengths[lag]["Step"]
+        ]
+        if empty_lags:
+            lag_text = ", ".join(str(lag) for lag in empty_lags)
+            raise ValueError(
+                "No jump-length data are available for frame interval(s): "
+                f"{lag_text}. Reduce Number of timepoints or load longer trajectories."
+            )
+
         ## Calculate the PDF histograms (required for CDF)
         HistVecJumps = np.arange(0, MaxJump + BinWidth, BinWidth)  # jump lengths in micrometers
         JumpProb = np.zeros((TimePoints - 1,
@@ -2159,6 +2226,7 @@ class SlimFastApp:
         ## Lower and Upper parameter bounds
         diff = np.array(UB) - np.array(LB)  # difference: used for initial parameters guess
         best_ssq2 = 5e10  # initial error
+        best_result = None
 
         # Need to ensure that the x-input is the same size as y-output
         if ModelFit == 1:
@@ -2312,8 +2380,8 @@ class SlimFastApp:
 
             ## See if the current fit is an improvement:
             if ssq2 < best_ssq2:
-                best_vals = out.params
                 best_ssq2 = ssq2
+                best_result = out
                 if verbose:
                     print('==================================================')
                     print('Improved fit on iteration {}'.format(i + 1))
@@ -2322,7 +2390,9 @@ class SlimFastApp:
                     print('==================================================')
             else:
                 print('Iteration {} did not yield an improved fit'.format(i + 1))
-        return out
+        if best_result is None:
+            raise RuntimeError("No fitting iteration produced a result")
+        return best_result
 
 
 
@@ -2363,48 +2433,78 @@ class SlimFastApp:
         if F_bound == None:
             F_bound = 'na'
 
-        histogram_spacer = 0.055
+        HistVecJumps = np.asarray(HistVecJumps, dtype=float)
+        emp_hist = np.asarray(emp_hist, dtype=float)
+        if emp_hist.ndim != 2 or emp_hist.shape[0] == 0:
+            raise ValueError("emp_hist must contain one row for each jump time lag")
+        if emp_hist.shape[1] != len(HistVecJumps):
+            raise ValueError("emp_hist columns must match HistVecJumps")
+
+        if sim_hist is not None:
+            if HistVecJumpsCDF is None:
+                raise ValueError("HistVecJumpsCDF is required when sim_hist is provided")
+            HistVecJumpsCDF = np.asarray(HistVecJumpsCDF, dtype=float)
+            sim_hist = np.asarray(sim_hist, dtype=float)
+            expected_shape = (emp_hist.shape[0], len(HistVecJumpsCDF))
+            if sim_hist.shape != expected_shape:
+                raise ValueError(
+                    f"sim_hist shape {sim_hist.shape} does not match {expected_shape}"
+                )
+
         number = emp_hist.shape[0]
         cmap = plt.get_cmap('viridis')
         colour = [cmap(i) for i in np.linspace(0, 1, number)]
 
+        # Reserve enough vertical space for both the empirical curve and its fit.
+        empirical_peak = float(np.nanmax(emp_hist))
+        fitted_peak = float(np.nanmax(sim_hist)) if sim_hist is not None else 0.0
+        curve_height = max(empirical_peak, fitted_peak, 1e-6)
+        histogram_spacer = 1.25 * curve_height
+
+        fig, ax = plt.subplots(figsize=(10, 5))
         Nbins = len(HistVecJumps)
         for i in range(emp_hist.shape[0] - 1, -1, -1):
             new_level = i * histogram_spacer
-            # 画基础线
-            plt.plot(HistVecJumps, [new_level] * Nbins, 'k-', linewidth=1)
+            ax.plot(HistVecJumps, [new_level] * Nbins, color='0.35', linewidth=0.8)
+            ax.fill_between(
+                HistVecJumps,
+                new_level,
+                emp_hist[i, :] + new_level,
+                step='post',
+                color=colour[i],
+                alpha=0.85,
+                label='Empirical data' if i == 0 else None
+            )
 
-            for j in range(Nbins):
-                y1 = new_level
-                y2 = emp_hist[i, j] + new_level
-                if j < Nbins - 1:
-                    x1 = HistVecJumps[j]
-                    x2 = HistVecJumps[j + 1]
-                else:
-                    # 最后一 bin：往后延一个 bin 宽度
-                    bin_w = HistVecJumps[-1] - HistVecJumps[-2]
-                    x1 = HistVecJumps[-1]
-                    x2 = HistVecJumps[-1] + bin_w
-                plt.fill([x1, x1, x2, x2], [y1, y2, y2, y1], color=colour[i])
+            if sim_hist is not None:
+                ax.plot(
+                    HistVecJumpsCDF,
+                    sim_hist[i, :] + new_level,
+                    color='black',
+                    linewidth=2,
+                    label='Model fit' if i == 0 else None
+                )
 
-            if type(sim_hist) != type(None):  ## HistVecJumpsCDF should also be provided
-                plt.plot(HistVecJumpsCDF, sim_hist[i, :] + new_level, 'k-', linewidth=2)
-            if TimeGap != None:
-                plt.text(0.8,  # 改成 0.8（80% x 轴长度）
-                         new_level + 0.3 * histogram_spacer,
-                         r'$\Delta t$ : {} ms'.format(TimeGap * (i + 1)))
-                # plt.text(0.6 * max(HistVecJumps), new_level + 0.3 * histogram_spacer,
-                #          '$\Delta t$ : {} ms'.format(TimeGap * (i + 1)))
+            if TimeGap is not None:
+                lag_label = r'$\Delta t = {:g}\ \mathrm{{ms}}$'.format(TimeGap * (i + 1))
             else:
-                # plt.text(0.6 * max(HistVecJumps), new_level + 0.3 * histogram_spacer, '${} \Delta t$'.format(i + 1))
-                plt.text(0.8,
-                         new_level + 0.3 * histogram_spacer,
-                         r'${}\,\Delta t$'.format(i + 1))
+                lag_label = r'${}\,\Delta t$'.format(i + 1)
+            ax.text(
+                0.80,
+                new_level + 0.18 * histogram_spacer,
+                lag_label,
+                transform=ax.get_yaxis_transform(),
+                ha='left',
+                va='bottom',
+                bbox=dict(facecolor='white', edgecolor='none', alpha=0.75, pad=1.5)
+            )
 
-        # plt.xlim(0, HistVecJumps.max())
-        plt.xlim(0,1)
-        plt.ylabel('Probability')
-        plt.xlabel('jump length ($\mu m$)')
+        x_max = min(1.0, float(HistVecJumps[-1]))
+        ax.set_xlim(0, x_max)
+        ax.set_ylim(-0.05 * curve_height,
+                    (number - 1) * histogram_spacer + 1.1 * curve_height)
+        ax.set_ylabel('Probability')
+        ax.set_xlabel('jump length ($\mu m$)')
         # if type(sim_hist) != type(None):
         #     plt.title(
         #         '{}; Cell number {}; Fit Type = {}; Dfree = {}; Dbound = {}; FracBound = {}, Total trajectories: {}; => Length 3 trajectories: {}, \nLocs = {}, Locs/Frame = {}; jumps: {}'
@@ -2422,42 +2522,91 @@ class SlimFastApp:
         #             len_trackedPar, Min3Traj, CellLocs,
         #             locs_per_frame,
         #             CellJumps))
-        plt.yticks([])
-        return plt.gcf()
+        ax.set_yticks([])
+        ax.legend(loc='upper center', bbox_to_anchor=(0.5, 1.12), ncol=2, frameon=False)
+        fig.tight_layout()
+        return fig
 
     def pdist(self,m):
         """Euclidean distance between two 2D points in a (2×2) array."""
         return np.hypot(m[0, 0] - m[1, 0], m[0, 1] - m[1, 1])
 
     def load_imagestack(self):
-        file_paths = filedialog.askopenfilenames(filetypes=[("TIF files", "*.tif")])
-        if file_paths:
-            full_path = file_paths[0]
-            self.image_bin['image_path'] = full_path  # 完整路径
-            self.image_bin['pathname'] = os.path.dirname(full_path)  # 目录
-            self.image_bin['filename'] = os.path.basename(full_path)  # 文件名
+        file_paths = filedialog.askopenfilenames(
+            filetypes=[("TIFF files", ("*.tif", "*.tiff", "*.TIF", "*.TIFF"))]
+        )
+        if not file_paths:
+            return
+        full_path = file_paths[0]
+        try:
+            source = tracking_source.open_viewer_source(full_path)
+            first_frame = tracking_source.read_viewer_frame(source, 1)
+            image = Image.fromarray(np.array(first_frame, copy=True))
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not load image: {e}")
+            return
 
+        height, width = source['frame_shape']
+        self.image_bin['image_path'] = full_path
+        self.image_bin['pathname'] = os.path.dirname(full_path)
+        self.image_bin['filename'] = os.path.basename(full_path)
+        self.image_bin['_viewer_source'] = source
+        self.image_bin['total_frames'] = source['total_frames']
+        self.image_bin['current_frame'] = 1
+        self.image_bin['width'], self.image_bin['height'] = width, height
+        self.image_bin['roi'] = [0, 0, width, height]
+        self.image_bin['h_roi'] = 0
+        self.image_bin['image_name'] = full_path
+        self.image_bin['raw_image'] = image
+        self.display_image(image, 1)
+
+    def _read_particle_text(self, filename, localization=False):
+        """Validate selected text data before changing the viewer's current state."""
+        if Path(filename).suffix.lower() != '.txt':
+            raise ValueError("Please select a .txt file.")
+        if localization:
+            with open(filename, encoding='utf-8-sig') as file:
+                header = file.readline().strip()
+            if not header:
+                raise ValueError("The localization TXT is empty or has no header.")
             try:
-                image = Image.open(full_path)
-                self.image_bin['total_frames'] = getattr(image, 'n_frames', 1)
-                self.image_bin['width'], self.image_bin['height'] = image.size
-                self.image_bin['roi'] = [0, 0, self.image_bin['width'], self.image_bin['height']]
-                self.image_bin['h_roi'] = 0
-                self.image_bin['image_name'] = full_path
-                self.image_bin['raw_image'] = image  # 可留着预览
-                self.display_image(image, 1)
-            except Exception as e:
-                messagebox.showerror("Error", f"Could not load image: {e}")
+                [float(value) for value in header.split()]
+            except ValueError:
+                pass
+            else:
+                raise ValueError(
+                    "Expected a localization TXT with a header (usually *_locs.txt). "
+                    "Use Load > Tracking Data for a trajectory table."
+                )
+        data = np.loadtxt(filename, delimiter='\t', skiprows=1 if localization else 0,
+                          ndmin=2, encoding='utf-8-sig')
+        min_columns = 8 if localization else 4
+        if data.size == 0 or data.shape[1] < min_columns:
+            raise ValueError(f"Expected non-empty numeric data with at least {min_columns} columns.")
+        if not np.isfinite(data[:, :min_columns]).all():
+            raise ValueError("Required data columns contain NaN or infinite values.")
+        index_columns = (0, 1) if localization else (2, 3)
+        indices = data[:, index_columns]
+        if np.any(indices < 0) or np.any(indices != np.floor(indices)):
+            raise ValueError("Frame numbers and particle/track IDs must be non-negative integers.")
+        return data
+
+    def _noise_std_from_sig2(self, sig2):
+        """Convert localization noise power to MATLAB's stored noise standard deviation."""
+        return np.sqrt(np.maximum(np.asarray(sig2, dtype=float), 0.0))
 
     def load_slimfast(self):
         """从 TXT 文件加载 SLIMfast 数据，并按原始 TIFF 尺寸渲染。"""
-        filename = filedialog.askopenfilename(filetypes=[("Text files", "*.txt")])
+        filename = filedialog.askopenfilename(
+            title="Select localization TXT (*_locs.txt)",
+            filetypes=[("All files", "*"), ("Text files", "*.txt")]
+        )
         if not filename:
             return
 
         # 读取 .txt
         try:
-            localization_data = np.loadtxt(filename, delimiter='\t', skiprows=1)
+            localization_data = self._read_particle_text(filename, localization=True)
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load file: {e}")
             return
@@ -2471,15 +2620,11 @@ class SlimFastApp:
         toolbar.grid(row=0, column=0, sticky='ew')
 
         buttons = [
-            ("Options", self.set_options),
-            ("Colormap", self.color_map_editor),
             ("Int Dist", self.particle_intensity_hist),
             ("Prec Dist", self.loc_prec),
             ("s2n Dist", self.snr_hist),
             ("Gen Traj", self.build_tracks),
             ("LOC Dist", self.detection_trace),
-            # ("GEN Movie", self.render_movie),
-            ("GEN Movie", self.export_three_snapshots),
             ("Scatter Plot", self.scatter_plot),
             ("Nuclear Seg", self.open_nuclear_segmentation)
         ]
@@ -2495,6 +2640,7 @@ class SlimFastApp:
             'is_superstack': False,
             'is_track': 0,
             'view_mode': 'monoView',
+            'current_frame': 1,
             'loc_start': 1,
             'loc_end': int(localization_data[-1, 1]),
 
@@ -2603,7 +2749,7 @@ class SlimFastApp:
         self.image_bin['radius'] = localization_data[:, IDX_R].astype(float)
 
         # noise: 在你的描述中文件给出 Sig2（方差），所以 noise = sqrt(max(Sig2,0))
-        self.image_bin['noise'] = np.maximum(localization_data[:, IDX_SIG2].astype(float), 0.0)
+        self.image_bin['noise'] = self._noise_std_from_sig2(localization_data[:, IDX_SIG2])
 
         # signal/alpha: 你的 _locs 中 alpha 是峰值强度（或已定义值）。
         # 这里使用你原来代码里和 MATLAB 等价的变换： signal = alpha / (sqrt(pi) * radius)
@@ -2650,8 +2796,10 @@ class SlimFastApp:
             import tifffile
             with tifffile.TiffFile(tif_path) as tif:
                 H, W = tif.pages[0].shape  # (rows, cols) = (height, width)
+                self.image_bin['image_dimensions_known'] = True
         except Exception:
             H, W = 320, 320  # 兜底
+            self.image_bin['image_dimensions_known'] = False
 
         self.image_bin['width'] = W
         self.image_bin['height'] = H
@@ -2747,6 +2895,7 @@ class SlimFastApp:
         self.image_bin['ctrsN'] = ctrsN[1:].astype(int)  # 1..max_f
 
     def open_nuclear_segmentation(self):
+        self._clear_segmentation_result()
         seg_win = tk.Toplevel(self.master)
         seg_win.title("Nuclear Segmentation")
         seg_win.geometry("800x600")
@@ -2838,11 +2987,6 @@ class SlimFastApp:
         # 读取所有粒子位置（像素级）
         x_all = np.array(self.image_bin['ctrsX'])  # 列坐标
         y_all = np.array(self.image_bin['ctrsY'])  # 行坐标
-        frame_all = np.array(self.image_bin['frame'])
-        signal_all = np.array(self.image_bin['signal'])
-        noise_all = np.array(self.image_bin['noise'])
-        radius_all = np.array(self.image_bin['radius'])
-
         # 注意粒子坐标是否经过 resize（需要配套 mask 尺寸）→ 可适配你的代码格式
         if self.raw_img.shape != mask.shape:
             scale_x = mask.shape[1] / self.raw_img.shape[1]
@@ -2856,29 +3000,39 @@ class SlimFastApp:
         # 限定范围防止越界
         valid = (x >= 0) & (x < mask.shape[1]) & (y >= 0) & (y < mask.shape[0])
 
-        x = x[valid]
-        y = y[valid]
-        frame_all = frame_all[valid]
-        signal_all = signal_all[valid]
-        noise_all = noise_all[valid]
-        radius_all = radius_all[valid]
+        # 对所有逐点字段应用同一个筛选索引；ROI、图像、逐帧计数等不是逐点字段。
+        keep = np.zeros(len(x_all), dtype=bool)
+        keep[valid] = mask[y[valid], x[valid]]
+        point_fields = (
+            'ctrsX', 'ctrsY', 'ctrsZ', 'frame', 'signal', 'noise', 'offset',
+            'radius', 'photons', 'precision', 'snr', 'sbr', 'cluster', 'class',
+            'channel',
+        )
+        filtered = {}
+        for key in point_fields:
+            if key not in self.image_bin or self.image_bin[key] is None:
+                continue
+            values = np.asarray(self.image_bin[key])
+            if values.ndim == 0 or values.shape[0] != len(keep):
+                messagebox.showerror(
+                    "ROI filtering",
+                    f"Point data '{key}' does not match the number of detections. "
+                    "Please reload the localization data."
+                )
+                return
+            filtered[key] = values[keep]
 
-        keep_idx = mask[y, x]
+        if not keep.any():
+            messagebox.showinfo("ROI filtering", "No localization points are inside the nuclear ROI.")
+            return
+        # 原图选择和检查在修改定位数据之前完成，取消时保留所有点。
+        source = self._prepare_tracking_source(expected_shape=self.raw_img.shape[:2])
+        if source is None:
+            return
 
-        # 再次限定数组长度
-        x_keep = x_all[valid][keep_idx]
-        y_keep = y_all[valid][keep_idx]
-        frame_keep = frame_all[keep_idx]
-        signal_keep = signal_all[keep_idx]
-        noise_keep = noise_all[keep_idx]
-        radius_keep = radius_all[keep_idx]
-
-        self.image_bin['ctrsX'] = x_keep
-        self.image_bin['ctrsY'] = y_keep
-        self.image_bin['frame'] = frame_keep
-        self.image_bin['signal'] = signal_keep
-        self.image_bin['noise'] = noise_keep
-        self.image_bin['radius'] = radius_keep
+        # 全部字段验证完成后再更新，避免部分字段已筛选、部分字段仍为原数据。
+        self.image_bin.update(filtered)
+        self.image_bin['total_particles'] = int(keep.sum())
 
         # 更新 ctrsN（每帧粒子数）
         frame = self.image_bin['frame']
@@ -2888,8 +3042,17 @@ class SlimFastApp:
             ctrsN[int(f)] += 1
         self.image_bin['ctrsN'] = ctrsN
 
-        print("[INFO] Running tracking on ROI-filtered detections:", len(x_keep))
-        self.build_tracks()
+        print("[INFO] Running tracking on ROI-filtered detections:", self.image_bin['total_particles'])
+        self.build_tracks(source=source)
+
+    def _clear_segmentation_result(self):
+        """输入图像改变后使旧遮罩及其预览失效，要求重新运行分割。"""
+        self.pred_mask = None
+        self.predicted_roi_mask = None
+        frame = getattr(self, 'seg_canvas_frame', None)
+        if frame is not None and frame.winfo_exists():
+            for widget in frame.winfo_children():
+                widget.destroy()
 
     def select_model_file(self):
         path = filedialog.askopenfilename(title="Select Model (.pth)", filetypes=[("PyTorch Model", "*.pth")])
@@ -2899,18 +3062,30 @@ class SlimFastApp:
 
     def load_raw_image(self):
         path = filedialog.askopenfilename(title="Select Raw Image")
-        if path:
-            self.raw_img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if not path:
+            return
+        try:
+            # 保留灰度原图的位深，在推理预处理时才转换为 8-bit。
+            raw_img = cv2.imread(path, cv2.IMREAD_GRAYSCALE | cv2.IMREAD_ANYDEPTH)
+            if raw_img is None:
+                raise ValueError("Could not read the selected raw image.")
+        except (cv2.error, ValueError) as e:
+            messagebox.showerror("Load Raw Image", str(e))
+            return
+        self.raw_img = raw_img
+        self._clear_segmentation_result()
 
     def load_render_image(self):
         path = filedialog.askopenfilename(title="Select Render Image")
         if path:
             self.render_img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+            self._clear_segmentation_result()
 
     def load_scatter_image(self):
         path = filedialog.askopenfilename(title="Select Scatter Image")
         if path:
             self.scatter_img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+            self._clear_segmentation_result()
 
     def run_segmentation(self):
         use_gpu = self.use_gpu_var.get()
@@ -2925,33 +3100,13 @@ class SlimFastApp:
         device = torch.device("cuda" if use_gpu and torch.cuda.is_available() else "cpu")
         print(f"[INFO] Using device: {device}")
 
-        # ---------- 关键：把图像先拉伸成训练时的“可视化 8-bit” ----------
-        def to_uint8_view(img):
-            arr = np.asarray(img)
-            if arr.dtype == np.uint16:
-                # 根据有效位深或分位数拉伸到 0–255（避免简单 >>8 导致全黑）
-                v1, v2 = np.percentile(arr, (1, 99))
-                if v2 <= v1:
-                    v1, v2 = float(arr.min()), float(arr.max() or 1)
-                out = np.clip((arr - v1) * 255.0 / (v2 - v1), 0, 255).astype(np.uint8)
-            elif np.issubdtype(arr.dtype, np.integer):
-                v1, v2 = np.percentile(arr, (1, 99))
-                if v2 <= v1:
-                    v1, v2 = float(arr.min()), float(arr.max() or 1)
-                out = np.clip((arr - v1) * 255.0 / (v2 - v1), 0, 255).astype(np.uint8)
-            else:
-                # 浮点：用分位数到 0–255
-                a = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-                v1, v2 = np.percentile(a, (1, 99))
-                if v2 <= v1:
-                    v1, v2 = float(a.min()), float(a.max() or 1)
-                out = np.clip((a - v1) * 255.0 / (v2 - v1), 0, 255).astype(np.uint8)
-            return out
+        # ---------- 在原始精度上计算亮度范围，再生成 8-bit 推理图像 ----------
+        from segmentation_utils import to_uint8_view
 
         raw_v = to_uint8_view(self.raw_img)
         rend_v = to_uint8_view(self.render_img)
         scat_v = to_uint8_view(self.scatter_img)
-        scat_v = np.flipud(scat_v)
+        # scat_v = np.flipud(scat_v)
 
         # 记录原尺寸，用于回贴
         H0, W0 = raw_v.shape[:2]
@@ -3097,7 +3252,7 @@ class SlimFastApp:
             initialfile=default_name,
             defaultextension=default_ext,
             filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg"), ("TIFF", "*.tif")],
-            title="保存为图像文件"
+            title="Save as Image File"
         )
         if not filepath:
             return
@@ -3110,15 +3265,15 @@ class SlimFastApp:
         # 4) 覆盖确认
         if os.path.exists(filepath):
             overwrite = messagebox.askyesno(
-                "文件已存在",
-                f"文件 {os.path.basename(filepath)} 已存在。\n是否覆盖？"
+                "File already exists",
+                f"File {os.path.basename(filepath)} already exists.\nOverwrite?"
             )
             if not overwrite:
                 return
 
         # 5) 保存（去掉边缘留白）
         self.fig.savefig(filepath, dpi=300, bbox_inches='tight', pad_inches=0)
-        messagebox.showinfo("保存成功", f"图像已保存到：\n{filepath}")
+        messagebox.showinfo("Saved", f"Image saved to:\n{filepath}")
 
     def compute_frame_particle_counts(self, filename_or_frames):
         # 假设 self.image_bin['frame'] 已经是 0-based (见我们之前的约定)
@@ -3131,22 +3286,6 @@ class SlimFastApp:
         for f in frames:
             counts[int(f)] += 1
         return counts, int(counts.sum())
-
-    def color_map_editor(self):
-        """颜色映射编辑器的回调函数，利用 colorchooser 弹出颜色选择对话框"""
-        print("Opening color map editor...")
-        # 弹出颜色选择对话框
-        color = colorchooser.askcolor(title="请选择颜色映射")
-        # 如果用户选择了颜色，color[1] 返回 16 进制字符串，否则为 None
-        if color[1]:
-            print("Selected color:", color[1])
-            # 在这里可以根据需要对颜色进行处理，例如更新某个控件或内部状态
-            # 例如，设置主窗口背景色：这里matlab函数并没有指明在那里做改变，后期考虑一下删除
-            self.img_window.config(bg=color[1])
-        else:
-            print("No color selected.")
-        print("Opening color map editor...")
-
 
     def add_stack(self, h_list):
         """Add a new image stack to the list."""
@@ -3182,6 +3321,7 @@ class SlimFastApp:
         self.image_bin['is_loaded'] = 0
         self.image_bin['is_superstack'] = 1
         self.image_bin['frame'] = 1
+        self.image_bin['current_frame'] = 1
         self.image_bin['stack'] = 1
         self.image_bin['stack_size'] = []  # To be filled later
 
@@ -3209,18 +3349,22 @@ class SlimFastApp:
 
     def load_tracking_txt(self):
         """从 TXT 文件加载跟踪数据，并生成轨迹列表。"""
-        filename = filedialog.askopenfilename(filetypes=[("Text files", "*.txt")])
+        filename = filedialog.askopenfilename(
+            title="Select tracking TXT (*_table.txt)",
+            filetypes=[("All files", "*"), ("Text files", "*.txt")]
+        )
         if not filename:
             return  # 用户取消选择
 
-        self.image_bin['pathname'] = filename
-        self.image_bin['filename'] = os.path.basename(filename)
         try:
             # 假设 TXT 文件中数据以空格或制表符分隔
-            tracking_data = np.loadtxt(filename, delimiter='\t')
+            tracking_data = self._read_particle_text(filename)
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load file: {e}")
             return
+
+        self.image_bin['pathname'] = filename
+        self.image_bin['filename'] = os.path.basename(filename)
 
         # tracking_data 的列含义：
         # 列0: x 坐标, 列1: y 坐标, 列2: 帧号, 列3: 轨迹编号（全局编号，不重置）
@@ -3274,6 +3418,7 @@ class SlimFastApp:
         self.image_bin['isLoaded'] = 1
         self.image_bin['isSuperstack'] = 0
         self.image_bin['frame'] = 1
+        self.image_bin['current_frame'] = 1
         self.image_bin['viewMode'] = 'monoView'
 
         # 假设图像尺寸固定为 320x320，ROI 同样固定
@@ -3285,10 +3430,6 @@ class SlimFastApp:
 
         # 显示跟踪数据
         self.display_tracking(I)
-
-        # 生成 AVI 视频
-        # output_filename = os.path.splitext(self.image_bin['filename'])[0] + '_tracking.avi'
-        self.create_avi_from_tracking()
 
         messagebox.showinfo("Success", f"Loaded {self.image_bin['filename']} tracking data successfully.")
 
@@ -3393,85 +3534,6 @@ class SlimFastApp:
         # 显示窗口
         win.deiconify()
 
-    def create_avi_from_tracking(self):
-        # ————————— 1) 选择保存路径 —————————
-        movie_path = filedialog.asksaveasfilename(
-            defaultextension=".avi", title="保存电影为"
-        )
-        if not movie_path:
-            return
-
-        # ————————— 2) 读取参数 —————————
-        fps = self.image_bin.get('fps', 10)
-        r_start = int(self.image_bin.get('r_start', 1))
-        r_end = int(self.image_bin['r_end'])
-
-        # 限制演示帧数不超过 2 分钟
-        max_demo = fps * 120
-        total = r_end - r_start + 1
-        if total > max_demo:
-            frame_indices = np.linspace(r_start, r_end, max_demo, dtype=int)
-        else:
-            frame_indices = np.arange(r_start, r_end + 1)
-
-        # ————————— 3) 打开视频写入器 —————————
-        writer = imageio.get_writer(
-            movie_path, fps=fps, codec='libx264',
-            pixelformat='yuv420p', mode='I'
-        )
-
-        # ————————— 4) 缩放系数 & 基本参数 —————————
-        scale = 2
-        H = int(self.image_bin['height'])
-        W = int(self.image_bin['width'])
-        bigW, bigH = W * scale, H * scale
-
-        tracks = self.image_bin['tracks']
-        colors = self.image_bin['trackColor']  # n_tracks×3 的 0–1
-        tw = int(self.image_bin.get('trackWidth', 2))
-        min_size = int(self.image_bin.get('minTracksize', 1))
-        max_size = float(self.image_bin.get('maxTracksize', float('inf')))
-
-        # ————————— 5) 逐帧渲染 —————————
-        for frame_idx in frame_indices:
-            # a) 新建一张放大后的黑底
-            big_img = Image.new('RGB', (bigW, bigH), (0, 0, 0))
-            draw = ImageDraw.Draw(big_img)
-
-            # b) 对每条轨迹：
-            for tid, tr in enumerate(tracks):
-                # 1) 先筛轨迹长度
-                L = tr.shape[0]
-                if L < min_size or L > max_size:
-                    continue
-
-                # 2) 如果当前帧已经超过这条轨迹的最后一帧，就不画它
-                track_end = int(tr[:, 2].max())
-                if frame_idx > track_end:
-                    continue
-
-                # 3) 收集所有在当前帧之前出现过的点
-                pts = [
-                    (int(pt[0] * scale), int(pt[1] * scale))
-                    for pt in tr
-                    if int(pt[2]) <= frame_idx
-                ]
-                if len(pts) < 2:
-                    continue
-
-                # 4) 转颜色到 0–255
-                c = colors[tid]
-                col = (int(255 * c[0]), int(255 * c[1]), int(255 * c[2]))
-
-                # 5) 画线
-                draw.line(pts, fill=col, width=tw * scale, joint="curve")
-
-            # c) 写入视频
-            writer.append_data(np.array(big_img))
-
-        writer.close()
-        messagebox.showinfo("Success", f"跟踪动画已保存到：\n{movie_path}")
-
     def convert_to_image(self, data):
         """
         将 NumPy 数组转换为 Tkinter 可显示的图像。
@@ -3528,7 +3590,7 @@ class SlimFastApp:
                         self.playing = False
                 except Exception as e:
                     self.playing = False
-                    messagebox.showerror("错误", f"播放失败: {str(e)}")
+                    messagebox.showerror("Error", f"Playback failed: {str(e)}")
 
             # 更新按钮状态
             self._update_button_state()
@@ -3541,7 +3603,7 @@ class SlimFastApp:
 
     def previous_frame(self):
         """Load the previous frame from the stack."""
-        frame = self.image_bin['frame'] - 1
+        frame = int(self.image_bin.get('current_frame', 1)) - 1
         pathname = self.image_bin['pathname']
         filename = self.image_bin['filename']
 
@@ -3567,44 +3629,30 @@ class SlimFastApp:
                     return
 
             # 更新当前帧编号
-            self.image_bin['frame'] = frame
+            self.image_bin['current_frame'] = frame
 
             # 如果成功加载图像，更新显示
             if image:
-                self.update_frame(image, frame)
+                self.image_bin['raw_image'] = image
+                self.display_image(image, frame)
 
         except Exception as e:
             messagebox.showerror("Error", f"Could not load image: {str(e)}")
-
-    def update_frame(self, image, frame):
-        """更新当前窗口中的图像和帧信息"""
-        if not hasattr(self, 'img_window') or not self.img_window.winfo_exists():
-            # 如果窗口不存在，重新初始化
-            self.create_image_window()
-
-        # 将图像转换为 Tkinter 兼容格式
-        img_tk = ImageTk.PhotoImage(image)
-
-        # 更新画布中的图像
-        self.roi_canvas.delete("all")  # 清空画布
-        self.roi_canvas.create_image(0, 0, anchor='nw', image=img_tk)
-        self.roi_canvas.image = img_tk  # 保持引用，避免垃圾回收
-
-        # 更新窗口标题
-        self.img_window.title(f"Frame {frame} of TIFF")  # 更新标题
 
     # 修改next_frame方法（优化显示逻辑）
     def next_frame(self):
         """加载下一帧并更新显示"""
         try:
-            current_frame = self.image_bin.get('frame', 0)
+            current_frame = int(self.image_bin.get('current_frame', 1))
             new_frame = current_frame + 1
             total_frames = self.image_bin.get('total_frames', 0)
+            if total_frames and new_frame > total_frames:
+                return True
             # 加载新帧图像
             image = self.load_frame(new_frame)  # 假设load_frame方法正确加载图像
             if image:
                 # 更新帧编号
-                self.image_bin['frame'] = new_frame
+                self.image_bin['current_frame'] = new_frame
                 # 更新原始图像，确保后续检测使用的是当前帧数据
                 self.image_bin['raw_image'] = image
                 # 显示图像
@@ -3629,6 +3677,7 @@ class SlimFastApp:
     def load_frame(self, frame_number):
         """封装帧加载逻辑（完整版）"""
         try:
+            frame_number = tracking_source.normalize_viewer_frame(frame_number)
             if self.image_bin.get('is_superstack', False):
                 # ==================================================================
                 # 超栈处理逻辑（多文件堆栈）
@@ -3684,6 +3733,10 @@ class SlimFastApp:
                 # ==================================================================
                 # 普通堆栈处理（单文件）
                 # ==================================================================
+                viewer_source = self.image_bin.get('_viewer_source')
+                if viewer_source is not None:
+                    frame = tracking_source.read_viewer_frame(viewer_source, frame_number)
+                    return Image.fromarray(np.array(frame, copy=True))
                 pathname = self.image_bin['pathname']
                 filename = self.image_bin['filename']
 
@@ -3721,10 +3774,13 @@ class SlimFastApp:
                 image_path = os.path.join(pathname, filename)
 
 
-            # 加载图像
-            image = Image.open(image_path)
-            image.seek(frame_number - 1)  # 移动到指定帧
-            return image
+            source = self.image_bin.get('_viewer_source')
+            resolved = str(Path(image_path).resolve())
+            if source is None or source.get('path') != resolved:
+                source = tracking_source.open_viewer_source(resolved)
+                self.image_bin['_viewer_source'] = source
+            frame = tracking_source.read_viewer_frame(source, frame_number)
+            return Image.fromarray(np.array(frame, copy=True))
 
         except Exception as e:
             raise Exception(f"Error loading {filename} frame {frame_number}: {str(e)}")
@@ -3742,9 +3798,7 @@ class SlimFastApp:
                 image_path = os.path.join(pathname, filename)
 
 
-            # 加载图像
-            image = Image.open(image_path)
-            image.seek(frame - 1)  # 移动到指定帧
+            image = self.load_single_stack(os.path.dirname(image_path), os.path.basename(image_path), frame)
             self.image_bin['image'] = image
             return image  # 返回图像对象而不是直接显示
 
@@ -3761,6 +3815,9 @@ class SlimFastApp:
         # 更新窗口标题
         self.img_window.title(f"Frame: {frame} - {self.image_bin.get('filename', '')}")
 
+        # 在显示处理前复制当前帧，导出时保留原始像素和位深。
+        self.current_export_img = image.copy()
+
         # ——— 1. 将 PIL Image 转为 float32 numpy 数组 ———
         arr = np.array(image, dtype=np.float32)
 
@@ -3770,11 +3827,9 @@ class SlimFastApp:
             arr /= arr.max()
         arr = (arr * 255).astype(np.uint8)
 
-        # 转回 PIL Image
+        # 亮度拉伸仅用于预览。
         pil_img = Image.fromarray(arr)
-
-        # 将处理后的数组转换回 PIL Image 对象
-        pil_img = Image.fromarray(arr)
+        self.image_bin['current_frame'] = tracking_source.normalize_viewer_frame(frame)
         scale = 2
         new_w, new_h = pil_img.width * scale, pil_img.height * scale
         pil_img = pil_img.resize((new_w, new_h), resample=Image.LANCZOS)
@@ -3853,78 +3908,32 @@ class SlimFastApp:
         self.display_scale = 2
 
     def save_displayed_image(self):
-        """
-        从原始 TIFF 直接读第一帧，按位深做“标准不拉伸”转换并保存为 8-bit 灰度 PNG。
-        - uint16: 使用高 8 位 (>>8)
-        - uint8 : 原样
-        - float : 若在[0,1]则*255，否则裁剪到[0,255]
-        - 其它整数: 按本类型范围线性映射到0..255（尽量接近标准转换）
-        不做任何锐化/缩放，尺寸与原图一致。
-        """
-        # 找原始路径（优先 image_path；其次 pathname+filename）
+        """将当前帧保存为 TIFF，保留原始像素数值、位深和尺寸。"""
+        image = getattr(self, 'current_export_img', None)
+        if image is None:
+            messagebox.showerror("Error", "No image is displayed")
+            return
+
         src_path = self.image_bin.get('image_path')
         if not src_path:
             pn, fn = self.image_bin.get('pathname', ''), self.image_bin.get('filename', '')
             if pn and fn:
                 src_path = os.path.join(pn, fn)
 
-        if not src_path or not os.path.isfile(src_path):
-            messagebox.showerror("错误", "找不到原始 TIFF 路径")
+        if not src_path:
+            messagebox.showerror("Error", "Original TIFF path not found")
             return
 
         base_dir = os.path.dirname(src_path)
         base_name = os.path.splitext(os.path.basename(src_path))[0]
-        save_path = os.path.join(base_dir, f"{base_name}_frame1_raw.png")
+        frame = int(self.image_bin.get('current_frame', 1))
+        save_path = os.path.join(base_dir, f"{base_name}_frame{frame}_raw.tif")
 
         try:
-            import tifffile, numpy as np
-            from PIL import Image
-
-            # 1) 直接从文件读取第1帧，确保拿到“真原始数据”
-            with tifffile.TiffFile(src_path) as tif:
-                arr = tif.pages[0].asarray()
-
-            # 2) 如果是多维（如(H,W,C)或(C,H,W)），取第0通道做灰度
-            if arr.ndim == 3:
-                if arr.shape[0] in (3, 4):  # (C,H,W)
-                    arr = arr[0]
-                elif arr.shape[-1] in (3, 4):  # (H,W,C)
-                    arr = arr[..., 0]
-                else:
-                    arr = arr[0]  # 不明确时取第0片
-            elif arr.ndim > 3:
-                while arr.ndim > 2:
-                    arr = arr[0]
-
-            # 3) 位深安全的“标准”8-bit 转换（不做直方图拉伸）
-            if arr.dtype == np.uint8:
-                arr8 = arr
-            elif arr.dtype == np.uint16:
-                arr8 = (arr >> 8).astype(np.uint8)  # 取高8位
-            elif arr.dtype == np.int16:
-                a = arr.astype(np.int32) - np.iinfo(np.int16).min  # 移到[0,65535]
-                arr8 = (np.clip(a, 0, 65535) >> 8).astype(np.uint8)
-            elif np.issubdtype(arr.dtype, np.floating):
-                a = np.nan_to_num(arr, nan=0.0, posinf=255.0, neginf=0.0)
-                if a.size and a.min() >= 0.0 and a.max() <= 1.0:
-                    arr8 = np.clip(a * 255.0, 0, 255).astype(np.uint8)
-                else:
-                    arr8 = np.clip(a, 0, 255).astype(np.uint8)
-            elif np.issubdtype(arr.dtype, np.integer):
-                info = np.iinfo(arr.dtype)
-                a = np.clip(arr.astype(np.int64), info.min, info.max).astype(np.float32)
-                # 线性映射到0..255（不是自适应拉伸，只是类型范围到8位）
-                arr8 = ((a - info.min) * (255.0 / (info.max - info.min))).astype(np.uint8)
-            else:
-                # 兜底：当成浮点裁剪
-                arr8 = np.clip(arr.astype(np.float32), 0, 255).astype(np.uint8)
-
-            # 4) 保存（不缩放，尺寸=原图）
-            Image.fromarray(arr8, mode='L').save(save_path)
-            messagebox.showinfo("保存成功", f"原始第一帧图像已保存为：\n{save_path}")
-
+            image.save(save_path, format='TIFF')
+            messagebox.showinfo("Saved", f"Frame {frame} image saved to:\n{save_path}")
         except Exception as e:
-            messagebox.showerror("保存失败", str(e))
+            messagebox.showerror("Save failed", str(e))
 
     def create_control_buttons(self):
         """创建控制按钮面板"""
@@ -3933,10 +3942,8 @@ class SlimFastApp:
             ("Play Movie", self.show_raw_stack),
             ("Next", self.next_frame),
             ("ROI", self.set_roi),
-            ("OPT", self.set_options),
             ("MAX PROJ", self.max_projection),
             ("RVE PROJ", self.mean_projection),
-            ("COLOR MAP", self.color_map_editor),
             ("INT DIST", self.pixel_intensity_hist),
             ("LOC TEST", self.show_loc_preview),
             ("LOC ALL", self.localization),
@@ -3958,1035 +3965,6 @@ class SlimFastApp:
         # Save 按钮作为最后一列，放在同一行里
         save_btn = tk.Button(self.button_frame, text="Save", command=self.save_displayed_image)
         save_btn.grid(row=0, column=len(buttons), padx=2, pady=4, sticky='ew')
-
-    def set_options(self):
-        """选项设置窗口"""
-        opt_win = tk.Toplevel()
-        opt_win.title("Options")
-        opt_win.geometry("450x400")
-
-        # 创建右键菜单
-        context_menu = tk.Menu(opt_win, tearoff=0)
-        context_menu.add_command(label="Save Settings", command=self.save_settings)
-        context_menu.add_command(label="Load Settings", command=self.load_settings)
-        opt_win.bind("<Button-3>", lambda e: context_menu.tk_popup(e.x_root, e.y_root))
-
-        # 使用Notebook管理标签页
-        notebook = ttk.Notebook(opt_win)
-        notebook.pack(expand=True, fill='both')
-
-        # 创建各选项页
-        self.create_localization_tab(notebook)
-        self.create_rendering_tab(notebook)
-        self.create_filters_tab(notebook)
-        self.create_scalebar_tab(notebook)
-        self.create_acquisition_tab(notebook)
-        self.create_tracking_tab(notebook)
-        self.create_trajectories_tab(notebook)
-
-        # 添加其他标签页...
-
-    def create_trajectories_tab(self, notebook):
-        """创建独立的轨迹显示参数标签页"""
-        tab = ttk.Frame(notebook)
-        notebook.add(tab, text="Trajectories")
-
-        # 滚动容器
-        canvas = tk.Canvas(tab)
-        scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
-        scroll_frame = ttk.Frame(canvas)
-
-        scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        # 主容器
-        main_frame = ttk.Frame(scroll_frame)
-        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
-
-        # 动态生成通道设置
-        for ch in range(1, self.image_bin.get('nTrackCh', 1) + 1):
-            self.create_channel_trajectory_section(main_frame, ch)
-
-        return tab
-
-    def create_channel_trajectory_section(self, parent, channel):
-        """创建单个通道的轨迹显示参数区块"""
-        ch_frame = ttk.LabelFrame(
-            parent,
-            text=f"Channel {channel} Display Settings",
-            padding=(10, 5)
-        )
-        ch_frame.grid(row=channel - 1, column=0, sticky="ew", pady=10)
-
-        # 初始化显示参数变量
-        self.init_channel_trajectory_params(channel)
-
-        # ========== 显示参数 ==========
-        display_frame = ttk.LabelFrame(ch_frame, text="Visualization Parameters")
-        display_frame.grid(row=0, column=0, columnspan=3, sticky='ew', padx=5, pady=5)
-
-        row = 0
-        # 帧范围
-        ttk.Label(display_frame, text="Frame Range:").grid(row=row, column=0, padx=5, pady=2, sticky='e')
-        ttk.Entry(display_frame, textvariable=self.image_bin[f'ch{channel}_rStart'], width=6).grid(row=row, column=1,
-                                                                                                   sticky='w')
-        ttk.Entry(display_frame, textvariable=self.image_bin[f'ch{channel}_rEnd'], width=6).grid(row=row, column=2,
-                                                                                                 sticky='w')
-        row += 1
-
-        # 颜色编码
-        ttk.Label(display_frame, text="Color Mode:").grid(row=row, column=0, padx=5, pady=2, sticky='e')
-        color_mode = ttk.Combobox(
-            display_frame,
-            textvariable=self.image_bin[f'ch{channel}_trackColorMode'],
-            values=['ensemble', 'individual'],
-            state='readonly',
-            width=10
-        )
-        color_mode.grid(row=row, column=1, padx=5, sticky='w')
-
-        # 颜色选择按钮
-        color_btn = tk.Canvas(display_frame, width=20, height=20,
-                              bg=self.image_bin[f'ch{channel}_trackColor'].get())
-        color_btn.grid(row=row, column=2, padx=5, sticky='w')
-        color_btn.bind("<Button-1>",
-                       lambda e, ch=channel: self.change_track_color(ch, color_btn))
-        row += 1
-
-        # 轨迹厚度
-        ttk.Label(display_frame, text="Line Thickness:").grid(row=row, column=0, padx=5, pady=2, sticky='e')
-        ttk.Entry(display_frame, textvariable=self.image_bin[f'ch{channel}_trackWidth'],
-                  width=8).grid(row=row, column=1, sticky='w')
-        row += 1
-
-        # 轨迹长度过滤
-        ttk.Checkbutton(
-            display_frame,
-            text="Track Length Filter:",
-            variable=self.image_bin[f'ch{channel}_isTracksizeThresh']
-        ).grid(row=row, column=0, padx=5, pady=2, sticky='e')
-        ttk.Entry(display_frame, textvariable=self.image_bin[f'ch{channel}_minTracksize'],
-                  width=5).grid(row=row, column=1, sticky='w')
-        ttk.Label(display_frame, text="to").grid(row=row, column=1, padx=45, sticky='e')
-        ttk.Entry(display_frame, textvariable=self.image_bin[f'ch{channel}_maxTracksize'],
-                  width=5).grid(row=row, column=2, sticky='w')
-        row += 1
-
-        # 显示窗口设置
-        ttk.Label(display_frame, text="Window Size (frames):").grid(row=row, column=0, padx=5, pady=2, sticky='e')
-        ttk.Entry(display_frame, textvariable=self.image_bin[f'ch{channel}_rW'],
-                  width=8).grid(row=row, column=1, sticky='w')
-        row += 1
-
-        # 高级显示选项
-        ttk.Checkbutton(
-            display_frame,
-            text="Accumulative Display",
-            variable=self.image_bin[f'ch{channel}_isCumsum']
-        ).grid(row=row, column=0, columnspan=2, padx=5, pady=2, sticky='w')
-        row += 1
-
-        ttk.Checkbutton(
-            display_frame,
-            text="Always Visible",
-            variable=self.image_bin[f'ch{channel}_trackVisibility']
-        ).grid(row=row, column=0, columnspan=2, padx=5, pady=2, sticky='w')
-
-        # 配置布局权重
-        display_frame.columnconfigure(0, weight=1)
-        ch_frame.columnconfigure(0, weight=1)
-
-    def init_channel_trajectory_params(self, channel):
-        """初始化轨迹显示参数"""
-        params = {
-            f'ch{channel}_rStart': tk.IntVar(value=1),
-            f'ch{channel}_rEnd': tk.IntVar(value='inf'),
-            f'ch{channel}_trackColorMode': tk.StringVar(value='ensemble'),
-            f'ch{channel}_trackColor': tk.StringVar(value='#FF0000'),
-            f'ch{channel}_trackWidth': tk.DoubleVar(value=1.0),
-            f'ch{channel}_isTracksizeThresh': tk.BooleanVar(value=False),
-            f'ch{channel}_minTracksize': tk.IntVar(value=0),
-            f'ch{channel}_maxTracksize': tk.IntVar(value=100),
-            f'ch{channel}_rW': tk.IntVar(value=5),
-            f'ch{channel}_isCumsum': tk.BooleanVar(value=False),
-            f'ch{channel}_trackVisibility': tk.BooleanVar(value=True),
-        }
-        self.image_bin.update(params)
-
-    def change_track_color(self, channel, color_canvas):
-        """修改轨迹颜色"""
-        color_code = colorchooser.askcolor(title=f"Channel {channel} Track Color")
-        if color_code[1]:
-            self.image_bin[f'ch{channel}_trackColor'].set(color_code[1])
-            color_canvas.config(bg=color_code[1])
-
-    def create_tracking_tab(self, notebook):
-        """创建支持多通道的跟踪参数标签页"""
-        tab = ttk.Frame(notebook)
-        notebook.add(tab, text="Tracking")
-
-        # 滚动容器
-        canvas = tk.Canvas(tab)
-        scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
-        scroll_frame = ttk.Frame(canvas)
-
-        scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        # 主容器
-        main_frame = ttk.Frame(scroll_frame)
-        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
-
-        # 动态生成通道设置
-        for ch in range(1, self.image_bin.get('nImCh', 1) + 1):
-            self.create_channel_tracking_section(main_frame, ch)
-
-        return tab
-
-    def create_channel_tracking_section(self, parent, channel):
-        """创建单个通道的跟踪参数区块"""
-        ch_frame = ttk.LabelFrame(
-            parent,
-            text=f"Channel {channel} Tracking Settings",
-            padding=(10, 5)
-        )
-        ch_frame.grid(row=channel - 1, column=0, sticky="ew", pady=10)
-
-        # 初始化通道参数
-        self.init_channel_tracking_params(channel)
-
-        # ========== 运动参数 ==========
-        motion_frame = ttk.LabelFrame(ch_frame, text="Motion Parameters")
-        motion_frame.grid(row=0, column=0, columnspan=3, sticky='ew', padx=5, pady=5)
-
-        row = 0
-        # 最大扩散系数
-        ttk.Label(motion_frame, text="Max Diffusion (μm²/s):", wraplength=200).grid(
-            row=row, column=0, padx=5, pady=2, sticky='e')
-        ttk.Entry(motion_frame, textvariable=self.image_bin[f'ch{channel}_max_diffusion_coeff'],
-                  width=8).grid(row=row, column=1, sticky='w')
-        row += 1
-
-        # 搜索扩展因子
-        ttk.Label(motion_frame, text="Search Expansion Factor:", wraplength=200).grid(
-            row=row, column=0, padx=5, pady=2, sticky='e')
-        ttk.Entry(motion_frame, textvariable=self.image_bin[f'ch{channel}_search_exp_factor'],
-                  width=8).grid(row=row, column=1, sticky='w')
-        row += 1
-
-        # ========== 关联参数 ==========
-        association_frame = ttk.LabelFrame(ch_frame, text="Association Parameters")
-        association_frame.grid(row=1, column=0, columnspan=3, sticky='ew', padx=5, pady=5)
-
-        row = 0
-        # 统计窗口
-        ttk.Label(association_frame, text="Statistics Window (frames):").grid(
-            row=row, column=0, padx=5, pady=2, sticky='e')
-        ttk.Entry(association_frame, textvariable=self.image_bin[f'ch{channel}_stat_win_frames'],
-                  width=8).grid(row=row, column=1, sticky='w')
-        row += 1
-
-        # 最大竞争者
-        ttk.Label(association_frame, text="Max Competitors:").grid(
-            row=row, column=0, padx=5, pady=2, sticky='e')
-        ttk.Entry(association_frame, textvariable=self.image_bin[f'ch{channel}_max_competitors'],
-                  width=8).grid(row=row, column=1, sticky='w')
-        row += 1
-
-        # 最大离线时间
-        ttk.Label(association_frame, text="Max OFF-Time (frames):").grid(
-            row=row, column=0, padx=5, pady=2, sticky='e')
-        ttk.Entry(association_frame, textvariable=self.image_bin[f'ch{channel}_max_off_time'],
-                  width=8).grid(row=row, column=1, sticky='w')
-        row += 1
-
-        # ========== 权重参数 ==========
-        weight_frame = ttk.LabelFrame(ch_frame, text="Weighting Parameters")
-        weight_frame.grid(row=2, column=0, columnspan=3, sticky='ew', padx=5, pady=5)
-
-        row = 0
-        # 强度波动权重
-        ttk.Label(weight_frame, text="Intensity Fluctuation Weight:").grid(
-            row=row, column=0, padx=5, pady=2, sticky='e')
-        ttk.Entry(weight_frame, textvariable=self.image_bin[f'ch{channel}_int_fluc_weight'],
-                  width=8).grid(row=row, column=1, sticky='w')
-        row += 1
-
-        # 扩散权重比例
-        ttk.Label(weight_frame, text="Diffusion Weight Ratio:", wraplength=200).grid(
-            row=row, column=0, padx=5, pady=2, sticky='e')
-        ttk.Entry(weight_frame, textvariable=self.image_bin[f'ch{channel}_diffusion_weight'],
-                  width=8).grid(row=row, column=1, sticky='w')
-
-        # 配置列权重
-        ch_frame.columnconfigure(0, weight=1)
-
-    def init_channel_tracking_params(self, channel):
-        """初始化通道跟踪参数"""
-        params = {
-            f'ch{channel}_max_diffusion_coeff': tk.DoubleVar(value=3),
-            f'ch{channel}_search_exp_factor': tk.DoubleVar(value=1.5),
-            f'ch{channel}_stat_win_frames': tk.IntVar(value=5),
-            f'ch{channel}_max_competitors': tk.IntVar(value=3),
-            f'ch{channel}_max_off_time': tk.IntVar(value=3),
-            f'ch{channel}_int_fluc_weight': tk.DoubleVar(value=0.5),
-            f'ch{channel}_diffusion_weight': tk.DoubleVar(value=0.7)
-        }
-        self.image_bin.update(params)
-
-    def create_localization_tab(self, notebook):
-        """创建支持多通道的定位设置标签页"""
-        tab = ttk.Frame(notebook)
-        notebook.add(tab, text="Localization")
-
-        # 创建滚动容器
-        canvas = tk.Canvas(tab)
-        scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas)
-
-        scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        # 主容器布局参数
-        main_padx = 15
-        main_pady = 10
-        row = 0
-
-        # 动态生成通道
-        for ch in range(1, 2):
-            # 每个通道的容器框架
-            ch_frame = ttk.LabelFrame(
-                scrollable_frame,
-                text=f"Channel {ch} Settings",
-                padding=(10, 5))
-            ch_frame.grid(row=row, column=0, padx=main_padx, pady=main_pady, sticky="ew")
-            row += 1
-
-            # ========== 通道参数存储 ==========
-            self.image_bin[f'ch{ch}'] = {
-                'loc_start': tk.StringVar(value="1"),
-                'loc_end': tk.StringVar(value="inf"),
-                'error_rate': tk.DoubleVar(value=-6),
-                'w2d': tk.IntVar(value=9),
-                'dfltn_loops': tk.IntVar(value=0),
-                'min_int': tk.IntVar(value=0),
-                'loc_parallel': tk.BooleanVar(value=True),
-                'n_cores': tk.StringVar(value='max'),
-                'spatial_correction': tk.BooleanVar(value=False),
-                'r_live': tk.BooleanVar(value=True),
-                'max_optim_iter': tk.IntVar(value=50),
-                'term_tol': tk.DoubleVar(value=-2),
-                'is_radius_tol': tk.BooleanVar(value=True),
-                'radius_tol': tk.DoubleVar(value=50),
-                'pos_tol': tk.DoubleVar(value=1.5)
-            }
-
-            # ========== 通道控件布局 ==========
-            # 第一行：帧范围
-            ttk.Label(ch_frame, text="Framerange:").grid(
-                row=0, column=0, padx=5, pady=5, sticky='e')
-            ttk.Entry(ch_frame, textvariable=self.image_bin[f'ch{ch}']['loc_start'],
-                      width=8).grid(row=0, column=1, sticky='w')
-            ttk.Label(ch_frame, text="-").grid(row=0, column=2)
-            ttk.Entry(ch_frame, textvariable=self.image_bin[f'ch{ch}']['loc_end'],
-                      width=8).grid(row=0, column=3, sticky='w')
-
-            # 第二行：错误率
-            ttk.Label(ch_frame, text="Error Rate [10^]:").grid(
-                row=1, column=0, padx=5, pady=5, sticky='e')
-            ttk.Entry(ch_frame, textvariable=self.image_bin[f'ch{ch}']['error_rate'],
-                      width=12).grid(row=1, column=1, columnspan=3, sticky='w')
-
-            # 第三行：检测窗口
-            ttk.Label(ch_frame, text="Detection Box [px]:").grid(
-                row=2, column=0, padx=5, pady=5, sticky='e')
-            ttk.Entry(ch_frame, textvariable=self.image_bin[f'ch{ch}']['w2d'],
-                      width=12).grid(row=2, column=1, columnspan=3, sticky='w')
-
-            # 第四行：迭代次数
-            ttk.Label(ch_frame, text="Deflation Loops:").grid(
-                row=3, column=0, padx=5, pady=5, sticky='e')
-            ttk.Entry(ch_frame, textvariable=self.image_bin[f'ch{ch}']['dfltn_loops'],
-                      width=12).grid(row=3, column=1, columnspan=3, sticky='w')
-
-            # 第五行：强度阈值
-            ttk.Label(ch_frame, text="Intensity Thresh [cnts]:").grid(
-                row=4, column=0, padx=5, pady=5, sticky='e')
-            ttk.Entry(ch_frame, textvariable=self.image_bin[f'ch{ch}']['min_int'],
-                      width=12).grid(row=4, column=1, columnspan=3, sticky='w')
-
-            # 第六行：并行处理
-            ttk.Label(ch_frame, text="Parallel Processing:").grid(
-                row=5, column=0, padx=5, pady=5, sticky='e')
-            ttk.Checkbutton(ch_frame, variable=self.image_bin[f'ch{ch}']['loc_parallel']
-                            ).grid(row=5, column=1, sticky='w')
-            ttk.Combobox(ch_frame,
-                         textvariable=self.image_bin[f'ch{ch}']['n_cores'],
-                         values=('max', '2', '3', '4'),
-                         width=4).grid(row=5, column=2, sticky='w')
-
-            # 第七行：空间校正
-            ttk.Label(ch_frame, text="Spatial Correction:").grid(
-                row=6, column=0, padx=5, pady=5, sticky='e')
-            ttk.Checkbutton(ch_frame,
-                            variable=self.image_bin[f'ch{ch}']['spatial_correction'],
-                            command=lambda c=ch: self.set_spatial_corr_path(c)
-                            ).grid(row=6, column=1, sticky='w')
-
-            # 第八行：实时定位
-            ttk.Label(ch_frame, text="Live Localization:").grid(
-                row=7, column=0, padx=5, pady=5, sticky='e')
-            ttk.Checkbutton(ch_frame,
-                            variable=self.image_bin[f'ch{ch}']['r_live']
-                            ).grid(row=7, column=1, sticky='w')
-
-            # 第九行：优化参数
-            ttk.Label(ch_frame, text="Max Iterations:").grid(
-                row=8, column=0, padx=5, pady=5, sticky='e')
-            ttk.Entry(ch_frame, textvariable=self.image_bin[f'ch{ch}']['max_optim_iter'],
-                      width=12).grid(row=8, column=1, columnspan=3, sticky='w')
-
-            # 第十行：终止容差
-            ttk.Label(ch_frame, text="Termination Tol [1e-]:").grid(
-                row=9, column=0, padx=5, pady=5, sticky='e')
-            ttk.Entry(ch_frame, textvariable=self.image_bin[f'ch{ch}']['term_tol'],
-                      width=12).grid(row=9, column=1, columnspan=3, sticky='w')
-
-            # 第十一行：半径容差
-            ttk.Label(ch_frame, text="Radius Tolerance:").grid(
-                row=10, column=0, padx=5, pady=5, sticky='e')
-            ttk.Checkbutton(ch_frame,
-                            variable=self.image_bin[f'ch{ch}']['is_radius_tol']
-                            ).grid(row=10, column=1, sticky='w')
-            ttk.Entry(ch_frame,
-                      textvariable=self.image_bin[f'ch{ch}']['radius_tol'],
-                      width=6).grid(row=10, column=2, sticky='w')
-            ttk.Label(ch_frame, text="%").grid(row=10, column=3, sticky='w')
-
-            # 第十二行：位置精修
-            ttk.Label(ch_frame, text="Position Tolerance [px]:").grid(
-                row=11, column=0, padx=5, pady=5, sticky='e')
-            ttk.Entry(ch_frame, textvariable=self.image_bin[f'ch{ch}']['pos_tol'],
-                      width=12).grid(row=11, column=1, columnspan=3, sticky='w')
-
-            # 配置列权重
-            ch_frame.columnconfigure(1, weight=1)
-
-        return tab
-
-    def set_spatial_corr_path(self, channel):
-        """处理空间校正路径选择 (对应 MATLAB 的 setSpatialCorrPath)"""
-        # 获取当前通道的校正状态变量
-        correction_var = self.image_bin[f'ch{channel}_spatial_correction']
-
-        if correction_var.get():
-            # 获取上次访问路径，默认为当前工作目录
-            initial_dir = self.image_bin.get('search_path', '.')
-
-            # 弹出文件选择对话框
-            file_path = filedialog.askopenfilename(
-                title='Select spatial Transformation matrix',
-                initialdir=initial_dir,
-                filetypes=[('MAT files', '*.mat')]
-            )
-
-            if file_path:
-                try:
-                    # 加载 MAT 文件
-                    mat_data = loadmat(file_path)
-                    t_mat = mat_data.get('tMat', None)
-
-                    if t_mat is not None:
-                        # 保存到参数库
-                        self.image_bin[f'ch{channel}_tMat'] = t_mat
-                        self.image_bin['search_path'] = file_path.rsplit('/', 1)[0]
-                        print(f"Loaded tMat for Channel {channel}")
-                    else:
-                        raise ValueError("tMat not found in the selected file")
-
-                except Exception as e:
-                    correction_var.set(False)  # 出错时取消勾选
-                    self.show_error(f"加载失败: {str(e)}")
-        else:
-            # 清除相关数据
-            if f'ch{channel}_tMat' in self.image_bin:
-                del self.image_bin[f'ch{channel}_tMat']
-            print(f"Disabled spatial correction for Channel {channel}")
-
-
-    def create_channel_settings(self, parent):
-        """动态生成通道设置"""
-        n_im_ch = self.image_bin.get('n_im_ch', 1)
-
-        for ch in range(n_im_ch):
-            frame = ttk.LabelFrame(parent, text=f"Channel {ch + 1}")
-            frame.grid(row=3 + ch, column=0, columnspan=3, padx=5, pady=5, sticky='ew')
-
-            # 定位参数
-            ttk.Label(frame, text="Detection Box (px):").grid(row=0, column=0)
-            ttk.Entry(frame, width=8).grid(row=0, column=1)
-
-            ttk.Label(frame, text="Deflation Loops:").grid(row=0, column=2)
-            ttk.Entry(frame, width=8).grid(row=0, column=3)
-
-    def create_rendering_tab(self, notebook):
-        """创建支持多通道的渲染设置标签页"""
-        tab = ttk.Frame(notebook)
-        notebook.add(tab, text="Rendering")
-
-        # 滚动容器
-        canvas = tk.Canvas(tab)
-        scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
-        scroll_frame = ttk.Frame(canvas)
-
-        scroll_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-
-        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        # 主容器
-        main_frame = ttk.Frame(scroll_frame)
-        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
-
-        # 获取通道数量
-        n_im_ch = self.image_bin.get('nImCh', 1)
-
-        # 动态生成通道设置
-        for ch in range(1, n_im_ch + 1):
-            self.create_channel_render_section(main_frame, ch)
-
-        return tab
-
-    def create_channel_render_section(self, parent, channel):
-        """创建单个通道的渲染设置区块"""
-        ch_frame = ttk.LabelFrame(
-            parent,
-            text=f"Channel {channel} Rendering Settings",
-            padding=(10, 5)
-        )
-        ch_frame.grid(row=channel - 1, column=0, sticky="ew", pady=10)
-
-        # 初始化通道参数
-        self.init_channel_render_params(channel)
-
-        # ========== 基本渲染参数 ==========
-        row = 0
-        padx = 5
-        pady = 3
-
-        # 帧范围
-        ttk.Label(ch_frame, text="Framerange:").grid(row=row, column=0, padx=padx, pady=pady, sticky='e')
-        ttk.Entry(ch_frame, textvariable=self.image_bin[f'ch{channel}_r_start'], width=6).grid(row=row, column=1,
-                                                                                               sticky='w')
-        ttk.Label(ch_frame, text="-").grid(row=row, column=2)
-        ttk.Entry(ch_frame, textvariable=self.image_bin[f'ch{channel}_r_end'], width=6).grid(row=row, column=3,
-                                                                                             sticky='w')
-        row += 1
-
-        # 扩展因子
-        ttk.Label(ch_frame, text="Expansion Factor:").grid(row=row, column=0, padx=padx, pady=pady, sticky='e')
-        ttk.Entry(ch_frame, textvariable=self.image_bin[f'ch{channel}_exf_new'], width=10).grid(row=row, column=1,
-                                                                                                columnspan=3,
-                                                                                                sticky='w')
-        row += 1
-
-        # 卷积模式
-        ttk.Label(ch_frame, text="Convolution Mode:").grid(row=row, column=0, padx=padx, pady=pady, sticky='e')
-        ttk.Combobox(
-            ch_frame,
-            textvariable=self.image_bin[f'ch{channel}_conv_mode'],
-            values=('fixed', 'dynamic', 'none'),
-            width=8,
-            state='readonly'
-        ).grid(row=row, column=1, columnspan=3, sticky='w')
-        row += 1
-
-        # 强度权重
-        ttk.Label(ch_frame, text="Intensity Weight:").grid(row=row, column=0, padx=padx, pady=pady, sticky='e')
-        ttk.Entry(ch_frame, textvariable=self.image_bin[f'ch{channel}_int_weight'], width=10).grid(row=row, column=1,
-                                                                                                   columnspan=3,
-                                                                                                   sticky='w')
-        row += 1
-
-        # 尺寸因子
-        ttk.Label(ch_frame, text="Size Factor:").grid(row=row, column=0, padx=padx, pady=pady, sticky='e')
-        ttk.Entry(ch_frame, textvariable=self.image_bin[f'ch{channel}_size_fac'], width=10).grid(row=row, column=1,
-                                                                                                 columnspan=3,
-                                                                                                 sticky='w')
-        row += 1
-
-        # ========== 电影设置 ==========
-        ttk.Label(ch_frame, text="Movie Settings", font=('Arial', 10, 'bold')).grid(row=row, column=0, columnspan=4,
-                                                                                    pady=10, sticky='w')
-        row += 1
-
-        # 步长
-        ttk.Label(ch_frame, text="Stepsize:").grid(row=row, column=0, padx=padx, pady=pady, sticky='e')
-        ttk.Entry(ch_frame, textvariable=self.image_bin[f'ch{channel}_r_step'], width=10).grid(row=row, column=1,
-                                                                                               columnspan=3, sticky='w')
-        row += 1
-
-        # 帧率
-        ttk.Label(ch_frame, text="FPS:").grid(row=row, column=0, padx=padx, pady=pady, sticky='e')
-        ttk.Entry(ch_frame, textvariable=self.image_bin[f'ch{channel}_fps'], width=10).grid(row=row, column=1,
-                                                                                            columnspan=3, sticky='w')
-        row += 1
-
-        # 压缩格式
-        ttk.Label(ch_frame, text="Compression:").grid(row=row, column=0, padx=padx, pady=pady, sticky='e')
-        ttk.Combobox(
-            ch_frame,
-            textvariable=self.image_bin[f'ch{channel}_mov_compression'],
-            values=('RLE', 'MSVC', 'none'),
-            width=8,
-            state='readonly'
-        ).grid(row=row, column=1, columnspan=3, sticky='w')
-        row += 1
-
-        # 累积电影
-        ttk.Checkbutton(
-            ch_frame,
-            text="Accumulative Movie",
-            variable=self.image_bin[f'ch{channel}_is_cumsum']
-        ).grid(row=row, column=0, columnspan=4, sticky='w', pady=5)
-
-        # 配置列权重
-        ch_frame.columnconfigure(1, weight=1)
-
-    def init_channel_render_params(self, channel):
-        """初始化通道渲染参数"""
-        params = {
-            f'ch{channel}_exf_new': tk.DoubleVar(value=1.0),
-            f'ch{channel}_conv_mode': tk.StringVar(value='fixed'),
-            f'ch{channel}_int_weight': tk.DoubleVar(value=1.0),
-            f'ch{channel}_size_fac': tk.DoubleVar(value=1.0),
-            f'ch{channel}_r_start': tk.IntVar(value=1),
-            f'ch{channel}_r_end': tk.IntVar(value=100),
-            f'ch{channel}_r_step': tk.IntVar(value=1),
-            f'ch{channel}_fps': tk.DoubleVar(value=30.0),
-            f'ch{channel}_mov_compression': tk.StringVar(value='RLE'),
-            f'ch{channel}_is_cumsum': tk.BooleanVar(value=False)
-        }
-        self.image_bin.update(params)
-
-    def create_filters_tab(self, notebook):
-        """创建支持多通道的过滤器设置标签页"""
-        tab = ttk.Frame(notebook)
-        notebook.add(tab, text="Filters")
-
-        # 滚动容器
-        canvas = tk.Canvas(tab)
-        scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
-        scroll_frame = ttk.Frame(canvas)
-
-        scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        # 主容器
-        main_frame = ttk.Frame(scroll_frame)
-        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
-
-        # 动态生成通道设置
-        for ch in range(1, self.image_bin.get('nImCh', 1) + 1):
-            self.create_channel_filter_section(main_frame, ch)
-
-        return tab
-
-    def create_channel_filter_section(self, parent, channel):
-        """创建单个通道的过滤器设置"""
-        ch_frame = ttk.LabelFrame(
-            parent,
-            text=f"Channel {channel} Filters",
-            padding=(10, 5))
-        ch_frame.grid(row=channel - 1, column=0, sticky="ew", pady=10)
-
-        # 初始化通道参数
-        self.init_channel_filter_params(channel)
-
-        # ========== 定位精度过滤 ==========
-        loc_frame = ttk.LabelFrame(ch_frame, text="Localization Precision (nm)")
-        loc_frame.grid(row=0, column=0, columnspan=5, sticky='ew', padx=5, pady=5)
-
-        # 启用复选框
-        ttk.Checkbutton(loc_frame,
-                        text="Enable",
-                        variable=self.image_bin[f'ch{channel}_is_thresh_loc_prec']
-                        ).grid(row=0, column=0)
-
-        # 最小值
-        ttk.Label(loc_frame, text="Min:").grid(row=0, column=1, padx=(10, 2))
-        ttk.Entry(loc_frame,
-                  textvariable=self.image_bin[f'ch{channel}_min_loc'],
-                  width=8).grid(row=0, column=2)
-
-        # 最大值
-        ttk.Label(loc_frame, text="Max:").grid(row=0, column=3, padx=(10, 2))
-        ttk.Entry(loc_frame,
-                  textvariable=self.image_bin[f'ch{channel}_max_loc'],
-                  width=8).grid(row=0, column=4)
-
-        # ========== 信噪比过滤 ==========
-        snr_frame = ttk.LabelFrame(ch_frame, text="Signal to Noise Ratio")
-        snr_frame.grid(row=1, column=0, columnspan=5, sticky='ew', padx=5, pady=5)
-
-        ttk.Checkbutton(snr_frame,
-                        text="Enable",
-                        variable=self.image_bin[f'ch{channel}_is_thresh_snr']
-                        ).grid(row=0, column=0)
-
-        ttk.Label(snr_frame, text="Min:").grid(row=0, column=1, padx=(10, 2))
-        ttk.Entry(snr_frame,
-                  textvariable=self.image_bin[f'ch{channel}_min_snr'],
-                  width=8).grid(row=0, column=2)
-
-        ttk.Label(snr_frame, text="Max:").grid(row=0, column=3, padx=(10, 2))
-        ttk.Entry(snr_frame,
-                  textvariable=self.image_bin[f'ch{channel}_max_snr'],
-                  width=8).grid(row=0, column=4)
-
-        # ========== 检测密度过滤 ==========
-        density_frame = ttk.LabelFrame(ch_frame, text="Detection Density")
-        density_frame.grid(row=2, column=0, columnspan=5, sticky='ew', padx=5, pady=5)
-
-        ttk.Checkbutton(density_frame,
-                        text="Enable",
-                        variable=self.image_bin[f'ch{channel}_is_thresh_density']
-                        ).grid(row=0, column=0)
-
-        ttk.Label(density_frame, text="Mode:").grid(row=0, column=1, padx=(10, 2))
-        ttk.Combobox(density_frame,
-                     textvariable=self.image_bin[f'ch{channel}_cluster_mode'],
-                     values=('inclusive', 'exclusive'),
-                     width=10,
-                     state='readonly').grid(row=0, column=2, columnspan=3)
-
-        # 配置列权重
-        ch_frame.columnconfigure(0, weight=1)
-
-    def init_channel_filter_params(self, channel):
-        """初始化通道过滤器参数"""
-        params = {
-            f'ch{channel}_is_thresh_loc_prec': tk.BooleanVar(value=False),
-            f'ch{channel}_min_loc': tk.DoubleVar(value=0.0),
-            f'ch{channel}_max_loc': tk.DoubleVar(value=100.0),
-            f'ch{channel}_is_thresh_snr': tk.BooleanVar(value=False),
-            f'ch{channel}_min_snr': tk.DoubleVar(value=2.0),
-            f'ch{channel}_max_snr': tk.DoubleVar(value=10.0),
-            f'ch{channel}_is_thresh_density': tk.BooleanVar(value=False),
-            f'ch{channel}_cluster_mode': tk.StringVar(value='inclusive')
-        }
-        self.image_bin.update(params)
-
-    def create_scalebar_tab(self, notebook):
-        """创建比例尺和时间戳设置标签页"""
-        tab = ttk.Frame(notebook)
-        notebook.add(tab, text="Bars")
-
-        # 参数存储结构
-        self.image_bin.update({
-            'is_colormap': tk.BooleanVar(value=False),
-            'colormap_width': tk.IntVar(value=10),
-            'is_scalebar': tk.BooleanVar(value=True),
-            'micron_bar_length': tk.DoubleVar(value=1000),
-            'is_timestamp': tk.BooleanVar(value=True),
-            'timestamp_inkrement': tk.DoubleVar(value=0.032),
-            'timestamp_size': tk.IntVar(value=2)
-        })
-
-        # 主布局框架
-        main_frame = ttk.Frame(tab, padding=10)
-        main_frame.pack(fill='both', expand=True)
-
-        row = 0
-        # ================= 颜色图设置 =================
-        colormap_frame = ttk.LabelFrame(main_frame, text="Colormap Settings")
-        colormap_frame.grid(row=row, column=0, columnspan=3, sticky='ew', pady=5)
-
-        ttk.Checkbutton(colormap_frame,
-                        text="Colormap",
-                        variable=self.image_bin['is_colormap']).grid(row=0, column=0, sticky='w')
-
-        ttk.Label(colormap_frame, text="[px]:").grid(row=0, column=1, padx=5)
-        ttk.Entry(colormap_frame,
-                  textvariable=self.image_bin['colormap_width'],
-                  width=8).grid(row=0, column=2)
-        row += 1
-
-        # ================= 比例尺设置 =================
-        scalebar_frame = ttk.LabelFrame(main_frame, text="Scalebar Settings")
-        scalebar_frame.grid(row=row, column=0, columnspan=3, sticky='ew', pady=5)
-
-        ttk.Checkbutton(scalebar_frame,
-                        text="Scalebar",
-                        variable=self.image_bin['is_scalebar']).grid(row=0, column=0, sticky='w')
-
-        ttk.Label(scalebar_frame, text="[μm]:").grid(row=0, column=1, padx=5)
-        ttk.Entry(scalebar_frame,
-                  textvariable=self.image_bin['micron_bar_length'],
-                  width=8).grid(row=0, column=2)
-        row += 1
-
-        # ================= 时间戳设置 =================
-        timestamp_frame = ttk.LabelFrame(main_frame, text="Timestamp Settings")
-        timestamp_frame.grid(row=row, column=0, columnspan=3, sticky='ew', pady=5)
-
-        ttk.Checkbutton(timestamp_frame,
-                        text="Timestamp",
-                        variable=self.image_bin['is_timestamp']).grid(row=0, column=0, sticky='w')
-
-        ttk.Label(timestamp_frame, text="Interval (s):").grid(row=0, column=1, padx=5)
-        ttk.Entry(timestamp_frame,
-                  textvariable=self.image_bin['timestamp_inkrement'],
-                  width=8).grid(row=0, column=2)
-
-        ttk.Label(timestamp_frame, text="Charactersize:").grid(row=1, column=1, padx=5)
-        ttk.Entry(timestamp_frame,
-                  textvariable=self.image_bin['timestamp_size'],
-                  width=8).grid(row=1, column=2)
-        row += 1
-
-        # 配置列权重
-        main_frame.columnconfigure(0, weight=1)
-
-        return tab
-
-    def create_acquisition_tab(self, notebook):
-        """创建支持多通道的采集参数标签页"""
-        tab = ttk.Frame(notebook)
-        notebook.add(tab, text="Acquisition")
-
-        # 滚动容器
-        canvas = tk.Canvas(tab)
-        scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
-        scroll_frame = ttk.Frame(canvas)
-
-        scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        # 主容器
-        main_frame = ttk.Frame(scroll_frame)
-        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
-
-        # 动态生成通道设置
-        for ch in range(1, self.image_bin.get('nImCh', 1) + 1):
-            self.create_channel_acq_section(main_frame, ch)
-
-        return tab
-
-    def create_channel_acq_section(self, parent, channel):
-        """创建单个通道的采集参数区块"""
-        ch_frame = ttk.LabelFrame(
-            parent,
-            text=f"Channel {channel} Acquisition Settings",
-            padding=(10, 5)
-        )
-        ch_frame.grid(row=channel - 1, column=0, sticky="ew", pady=10)
-
-        # 初始化通道参数
-        self.init_channel_acq_params(channel)
-
-        # ========== 光学参数 ==========
-        optics_frame = ttk.LabelFrame(ch_frame, text="Optical Parameters")
-        optics_frame.grid(row=0, column=0, columnspan=3, sticky='ew', padx=5, pady=5)
-
-        row = 0
-        # 像素尺寸
-        ttk.Label(optics_frame, text="Pixel Size (μm):").grid(row=row, column=0, sticky='e', padx=5)
-        px_entry = ttk.Entry(optics_frame, textvariable=self.image_bin[f'ch{channel}_px_size'], width=10)
-        px_entry.grid(row=row, column=1, sticky='w')
-        self.create_tooltip(px_entry, "Physical pixel size / Total magnification\n"
-                                      "Examples:\n60x1.0: 0.267μm\n60x1.6: 0.167μm\n150x1.0: 0.107μm")
-        row += 1
-
-        # 发射波长
-        ttk.Label(optics_frame, text="Emission WL (nm):").grid(row=row, column=0, sticky='e', padx=5)
-        wl_entry = ttk.Entry(optics_frame, textvariable=self.image_bin[f'ch{channel}_emission_wl'], width=10)
-        wl_entry.grid(row=row, column=1, sticky='w')
-        self.create_tooltip(wl_entry, "Emission wavelength in nanometers")
-        row += 1
-
-        # 数值孔径
-        ttk.Label(optics_frame, text="N.A.:").grid(row=row, column=0, sticky='e', padx=5)
-        na_entry = ttk.Entry(optics_frame, textvariable=self.image_bin[f'ch{channel}_na'], width=10)
-        na_entry.grid(row=row, column=1, sticky='w')
-        self.create_tooltip(na_entry, "Numerical aperture of the objective")
-        row += 1
-
-        # ========== PSF参数 ==========
-        psf_frame = ttk.LabelFrame(ch_frame, text="PSF Parameters")
-        psf_frame.grid(row=1, column=0, columnspan=3, sticky='ew', padx=5, pady=5)
-
-        row = 0
-        # PSF缩放
-        ttk.Label(psf_frame, text="PSF Scaling:").grid(row=row, column=0, sticky='e', padx=5)
-        scale_entry = ttk.Entry(psf_frame, textvariable=self.image_bin[f'ch{channel}_psf_scale'], width=10)
-        scale_entry.grid(row=row, column=1, sticky='w')
-        self.create_tooltip(scale_entry, "PSF scaling factor for simulation")
-        # **绑定事件，当用户修改 `PSF Scaling` 时自动计算 `PSF Std`**
-        scale_entry.bind("<KeyRelease>", lambda event: self.calc_psf(channel))
-        row += 1
-
-        # PSF标准差
-        ttk.Label(psf_frame, text="PSF Std [px]:").grid(row=row, column=0, sticky='e', padx=5)
-        std_entry = ttk.Entry(psf_frame, textvariable=self.image_bin[f'ch{channel}_psf_std'], width=10,
-                              state='readonly')
-        std_entry.grid(row=row, column=1, sticky='w')
-        self.create_tooltip(std_entry, "Calculated PSF standard deviation (read-only)")
-        row += 1
-
-        # ========== 探测器参数 ==========
-        detector_frame = ttk.LabelFrame(ch_frame, text="Detector Parameters")
-        detector_frame.grid(row=2, column=0, columnspan=3, sticky='ew', padx=5, pady=5)
-
-        row = 0
-        # 光子计数
-        ttk.Label(detector_frame, text="Counts/Photon:").grid(row=row, column=0, sticky='e', padx=5)
-        cnt_entry = ttk.Entry(detector_frame, textvariable=self.image_bin[f'ch{channel}_counts_per_photon'], width=10)
-        cnt_entry.grid(row=row, column=1, sticky='w')
-        self.create_tooltip(cnt_entry, "Photon to digital count conversion factor")
-        row += 1
-
-        # 延迟时间
-        ttk.Label(detector_frame, text="Lag Time [ms]:").grid(row=row, column=0, sticky='e', padx=5)
-        lag_entry = ttk.Entry(detector_frame, textvariable=self.image_bin[f'ch{channel}_lag_time'], width=10)
-        lag_entry.grid(row=row, column=1, sticky='w')
-        self.create_tooltip(lag_entry, "Camera lag time between frames")
-        row += 1
-
-        # 帧尺寸
-        ttk.Label(detector_frame, text="Frame Size [px]:").grid(row=row, column=0, sticky='e', padx=5)
-        size_entry = ttk.Entry(detector_frame, textvariable=self.image_bin[f'ch{channel}_frame_size'], width=10)
-        size_entry.grid(row=row, column=1, sticky='w')
-        self.create_tooltip(size_entry, "Image frame dimensions (square)")
-
-        # 配置列权重
-        ch_frame.columnconfigure(0, weight=1)
-
-    def init_channel_acq_params(self, channel):
-        """初始化通道采集参数"""
-        params = {
-            f'ch{channel}_px_size': tk.DoubleVar(value=0.16),
-            f'ch{channel}_emission_wl': tk.DoubleVar(value=590.0),
-            f'ch{channel}_na': tk.DoubleVar(value=1.49),
-            f'ch{channel}_psf_scale': tk.DoubleVar(value=1.35),
-            f'ch{channel}_psf_std': tk.DoubleVar(value=1.03),
-            f'ch{channel}_counts_per_photon': tk.DoubleVar(value=20.2),
-            f'ch{channel}_lag_time': tk.DoubleVar(value=50.0),
-            f'ch{channel}_frame_size': tk.IntVar(value=256)
-        }
-        self.image_bin.update(params)
-
-    def create_tooltip(self, widget, text):
-        """创建简易工具提示"""
-        widget.bind("<Enter>", lambda e: self.show_tooltip(e.widget, text))
-        widget.bind("<Leave>", lambda e: self.hide_tooltip())
-
-    def show_tooltip(self, widget, text):
-        """显示工具提示"""
-        x = widget.winfo_rootx() + 20
-        y = widget.winfo_rooty() + 20
-        self.tooltip = tk.Toplevel()
-        self.tooltip.wm_overrideredirect(True)
-        self.tooltip.geometry(f"+{x}+{y}")
-        ttk.Label(self.tooltip, text=text, background="#ffffe0",
-                  relief="solid", borderwidth=1, padding=5).pack()
-
-    def hide_tooltip(self):
-        """隐藏工具提示"""
-        if hasattr(self, 'tooltip'):
-            self.tooltip.destroy()
-
-    def calc_psf(self, src_widget, channel, fieldname):
-        """计算 PSF 标准差并更新显示 (对应 MATLAB 的 calcPSF 函数)"""
-        try:
-            # 将输入值转换为浮点数并保存到参数库
-            input_value = float(src_widget.get())
-            self.image_bin[f'ch{channel}_{fieldname}'].set(input_value)
-
-            # 从参数库获取相关参数
-            psf_scale = self.image_bin[f'ch{channel}_psfScale'].get()
-            em_wavelength = self.image_bin[f'ch{channel}_emWvlnth'].get()
-            na_value = self.image_bin[f'ch{channel}_NA'].get()
-            px_size = self.image_bin[f'ch{channel}_pxSize'].get()
-
-            # 避免除零错误
-            if na_value == 0 or px_size == 0:
-                self.image_bin[f'ch{channel}_psf_std'].set("Error")
-                return
-
-            # PSF 计算公式
-            psf_std = psf_scale * 0.55 * (em_wavelength / 1000)
-            psf_std /= na_value * 1.17 * 2 * px_size
-
-            # 更新显示控件（假设有对应的显示变量）
-            if hasattr(self, 'psf_std_display'):
-                self.psf_std_display.set(f"{psf_std:.2f}")
-
-            # 保存计算结果到参数库
-            self.image_bin[f'ch{channel}_psfStd'].set(psf_std)
-
-        except ValueError:
-            # 处理无效输入
-            self.show_error("Invalid input value")
-
-    def show_error(self, message):
-        """统一错误提示"""
-        messagebox.showerror(
-            "Input Error",
-            f"{message}\nPlease enter a valid number",
-            parent=self.root
-        )
-
-    def save_settings(self):
-        """保存设置到文件"""
-        try:
-            settings = {k: v.get() for k, v in self.image_bin.items()
-                        if isinstance(v, (tk.StringVar, tk.IntVar, tk.DoubleVar, tk.BooleanVar))}
-            with open('settings.json', 'w') as f:
-                json.dump(settings, f)
-            messagebox.showinfo("Success", "Settings saved successfully!")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to save settings: {str(e)}")
-
-    def load_settings(self):
-        """从文件加载设置"""
-        try:
-            with open('settings.json') as f:
-                settings = json.load(f)
-                for k, v in settings.items():
-                    if k in self.image_bin:
-                        self.image_bin[k].set(v)
-            messagebox.showinfo("Success", "Settings loaded successfully!")
-        except FileNotFoundError:
-            messagebox.showerror("Error", "Settings file not found!")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to load settings: {str(e)}")
 
 
     ##############################################
@@ -5099,16 +4077,17 @@ class SlimFastApp:
     def show_loc_preview(self, frame=None):
         """
         显示基于 ROI 的检测位置预览。
-        如果传入 frame，则更新当前帧，否则使用 self.image_bin['frame']。
+        如果传入 frame，则更新当前帧，否则使用 self.image_bin['current_frame']。
         该函数重新调用检测函数 detect_et_estime_part_1vue_deflt，
         并在新的 Tkinter 窗口中嵌入 matplotlib 图形显示检测结果。
         """
         try:
             # 更新当前帧
             if frame is not None:
-                self.image_bin['frame'] = frame
+                frame = tracking_source.normalize_viewer_frame(frame)
+                self.image_bin['current_frame'] = frame
             else:
-                frame = self.image_bin.get('frame', 0)
+                frame = int(self.image_bin.get('current_frame', 1))
 
 
             # 检查图像堆栈或当前帧图像是否加载
@@ -5165,7 +4144,7 @@ class SlimFastApp:
             height_roi = roi[3]
 
             # 调用检测函数
-            list_arr, dfltI, mask, good = self.detect_et_estime_part_1vue_deflt(
+            list_arr, dfltI, mask, good = detect_et_estime_part_1vue_deflt(
                 I_cropped_np,
                 w2d,
                 psf_std,
@@ -5306,67 +4285,8 @@ class SlimFastApp:
             N = 0
         return rI, new_width, new_height, N
 
-    def imprint_scalebar(self, I, width, height, exf, bar_length, px_size, size_fac, mode):
-        """Imprint a scale bar onto the image."""
-        bar_unit = self.px_chars(height, width, f"{bar_length}nm", size_fac)
 
-        px_bar_length = round(bar_length / (1000 * px_size / exf))
-        px_bar_height = int(np.ceil(max(exf / 3, px_bar_length / 20)))
-        bar = np.ones((px_bar_height, px_bar_length))
 
-        tmp = bar.shape[1] - bar_unit.shape[1]
-        if tmp > 0:
-            bar = np.vstack([
-                np.hstack([np.zeros((bar_unit.shape[0], tmp // 2)), bar_unit,
-                           np.zeros((bar_unit.shape[0], np.ceil(tmp / 2)))]),
-                np.zeros((2, bar.shape[1])),
-                bar
-            ])
-        elif tmp < 0:
-            bar = np.vstack([
-                bar_unit,
-                np.zeros((2, bar_unit.shape[1])),
-                np.hstack([np.zeros((px_bar_height, -tmp // 2)), bar, np.zeros((px_bar_height, np.ceil(-tmp / 2)))])
-            ])
-        else:
-            bar = np.vstack([bar_unit, np.zeros((2, bar.shape[1])), bar])
-
-        bar_offset_x = 4 * px_bar_height
-        bar_offset_y = 4 * px_bar_height
-        offset = height * (width - (bar.shape[1] + bar_offset_x)) + bar_offset_y
-
-        idx = np.where(np.vstack([bar, np.zeros((height - bar.shape[0], bar.shape[1]))]))[0] + offset
-
-        if mode == 1:
-            I[idx] = 255
-        else:
-            I[np.concatenate([idx, idx + height * width, idx + 2 * height * width])] = 255
-
-        return I
-
-    def imprint_timestamp(self, I, width, height, time, size_fac, mode):
-        """Imprint a timestamp onto the image."""
-        stamp = self.px_chars(height, width, f"{time:.3f}".replace('.', 'p') + '_S', size_fac)
-
-        bar_offset_x = int(np.ceil(max(size_fac * 2, stamp.shape[1] / 5)))
-        bar_offset_y = bar_offset_x
-
-        idx = np.where(np.vstack([stamp, np.zeros((height - stamp.shape[0], stamp.shape[1]))]))[0] + \
-              bar_offset_x * height + bar_offset_y
-
-        if mode == 1:
-            I[idx] = 255
-        else:
-            I[np.concatenate([idx, idx + height * width, idx + 2 * height * width])] = 255
-
-        return I
-
-    def px_chars(self, height, width, text, size_fac):
-        """Placeholder function to create pixel character representation."""
-        # This function should create a binary image representation of the text
-        # For now, return a dummy array
-        text_width = len(text) * size_fac  # Simplified width calculation
-        return np.ones((height // 10, text_width), dtype=np.uint8)  # Placeholder for text
 
     def pixel_intensity_hist(self):
         """显示强度直方图（像素强度）"""
@@ -5375,14 +4295,39 @@ class SlimFastApp:
         fig_new.title("Pixel Intensity Distribution")
         fig_new.geometry("650x600")
 
-        # 使用 load_imagestack 加载的图像数据
-        image_file = self.image_bin.get('pathname')
-        try:
-            im = Image.open(image_file)
-            I = np.array(im).astype(float)
-        except Exception as e:
-            print(f"Load image failed: {e}")
-            return
+        # 优先使用当前正在查看的那一帧（raw_image 由 load_imagestack / next_frame / previous_frame 维护）
+        raw = self.image_bin.get('raw_image')
+        I = None
+        if raw is not None:
+            try:
+                I = np.array(raw).astype(float)
+            except Exception:
+                I = None
+
+        # 兜底：raw_image 不可用时，再从文件读取当前帧（seek 到 frame）
+        if I is None:
+            image_file = self.image_bin.get('image_path')
+            if not image_file:
+                pn = self.image_bin.get('pathname', '')
+                fn = self.image_bin.get('filename', '')
+                if pn and fn:
+                    image_file = os.path.join(pn, fn)
+            if not image_file or not os.path.isfile(image_file):
+                messagebox.showerror("Error", "Original TIFF path not found")
+                return
+
+            try:
+                frame = int(self.image_bin.get('current_frame', 1))
+                source = self.image_bin.get('_viewer_source')
+                resolved = str(Path(image_file).resolve())
+                if source is None or source.get('path') != resolved:
+                    source = tracking_source.open_viewer_source(resolved)
+                    self.image_bin['_viewer_source'] = source
+                frame = min(frame, int(source['total_frames']))
+                I = tracking_source.read_viewer_frame(source, frame).astype(float)
+            except Exception as e:
+                messagebox.showerror("Error", f"Load image failed: {e}")
+                return
 
         # 创建一个 matplotlib Figure 对象和坐标轴
         fig = plt.Figure(figsize=(6, 4))
@@ -5494,343 +4439,19 @@ class SlimFastApp:
         fig_new.grid_rowconfigure(1, weight=0)
         fig_new.grid_columnconfigure(0, weight=1)
 
-    def build_movie_preview(self):
-        """Build movie preview based on current settings."""
-        # Here we would implement the logic for building the movie preview
-        # This is just a placeholder implementation
-        # 构造fig_params参数
-        fig_params = {
-            'pathname': self.image_bin.get('pathname', ''),
-            'filename': self.image_bin.get('filename', ''),
-            'elements': self.image_bin.get('elements', 0),
-            'startPnt': self.image_bin.get('startPnt', 0),
-            'cntsPerPhoton': self.image_bin.get('cntsPerPhoton', 20.2),
-            'pxSize': self.image_bin.get('pxSize', 0.1),
-            'isThreshDensity': self.image_bin.get('isThreshDensity', False),
-            'isThreshSNR': self.image_bin.get('isThreshSNR', False),
-            'isThreshLocPrec': self.image_bin.get('isThreshLocPrec', False),
-            'hROI': self.image_bin.get('hROI', None)
-        }
-        idx = [-1] + list(np.cumsum([1] * 10))  # Placeholder for ctrsN
 
-        # First movie frame setup
-        start_point = idx[self.image_bin['r_start']] + 1
-        elements = idx[self.image_bin['r_start'] + self.image_bin['r_w']] - max(1, start_point) + 1
 
-        roi = self.image_bin['roi']
-        # 设置return_flags
-        if self.image_bin['conv_mode'] != 1:
-            return_val = [1, 1, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0]
-        else:
-            return_val = [1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]
 
-            # 调用preprocess_data
-            data = self.preprocess_data(
-                fig_params=fig_params,
-                return_flags=return_val,
-                roi=roi
-            )
-        movie_frame, width, height, N = self.render_image_data(data, roi)
 
-        # Create preview window
-        preview_fig = tk.Toplevel(self.master)
-        preview_fig.title("Movie Preview")
-        preview_fig.geometry("800x600")
 
-        # Create a frame for the canvas
-        canvas_frame = tk.Frame(preview_fig)
-        canvas_frame.grid(row=0, column=0, sticky='nsew')
 
-        # Configure row and column weights for responsiveness
-        preview_fig.grid_rowconfigure(0, weight=1)
-        preview_fig.grid_columnconfigure(0, weight=1)
 
-        # Create axes for image display
-        preview_ax = tk.Canvas(canvas_frame, bg='white')
-        preview_ax.grid(row=0, column=0, sticky='nsew')
 
-        # Display the rendered movie frame
-        preview_ax.create_image(0, 0, anchor=tk.NW, image=ImageTk.PhotoImage(Image.fromarray(movie_frame)))
 
-        # Add additional UI elements like lines and text
-        preview_ax.create_line(0, height, width, height, fill="white", width=3)
-        preview_ax.create_text(0.25 * width, 0.75 * height, text='Frame 1', font=('Arial', 15), fill='white')
-        preview_ax.create_text(0.75 * width, 0.25 * height, text='Accumulate', font=('Arial', 15), fill='white')
 
-        # Adjust canvas size to fit the image
-        preview_ax.config(scrollregion=preview_ax.bbox(tk.ALL))
 
-    def preprocess_data(self, fig_params, return_flags, roi):
-        """
-        数据预处理主函数 (对应 MATLAB 的 preprocessData)
-        :param fig_params: 窗口参数字典
-        :param return_flags: 需要返回的数据标志列表
-        :param roi: 感兴趣区域 [x, y, width, height]
-        :return: 处理后的数据字典
-        """
-        # 初始化变量
-        var_names = [
-            'ctrsX', 'ctrsY', 'signal', 'noise', 'offset',
-            'radius', 'frame', 'photons', 'precision',
-            'snr', 'sbr', 'cluster'
-        ]
 
-        # 初始化加载标志
-        load_flags = self._init_load_flags(return_flags, fig_params)
 
-        # 加载数据
-        data = self._load_data_from_disk(fig_params, load_flags, var_names)
-
-        # ROI过滤
-        data = self._apply_roi_filter(data, load_flags, roi, var_names)
-
-        # 计算衍生指标
-        data = self._calculate_metrics(data, fig_params, return_flags)
-
-        # 应用阈值过滤
-        data = self._apply_thresholds(data, fig_params, load_flags, return_flags, var_names)
-
-        # 密度聚类过滤
-        data = self._apply_density_filter(data, fig_params, load_flags, return_flags, var_names)
-
-        # 清理不需要的字段
-        data = self._cleanup_fields(data, return_flags, var_names)
-
-        return data
-
-    def _init_load_flags(self, return_flags, fig_params):
-        """初始化数据加载标志"""
-        load_flags = [False] * 12  # 对应 MATLAB 的 loadValue(1:12)
-
-        # 基础加载逻辑
-        load_flags[0:7] = return_flags[0:7]
-
-        # 条件判断加载
-        if return_flags[7]: load_flags[5] = True
-        if return_flags[8]: load_flags[2:5] = [True] * 3
-        if return_flags[9]: load_flags[2:5] = [True] * 3
-        if return_flags[10]: load_flags[2:4] = [True] * 2
-        if return_flags[11] or fig_params.get('isThreshDensity', False):
-            load_flags[0:2] = [True] * 2
-            load_flags[5:7] = [True] * 2
-
-        # 其他条件
-        if fig_params.get('hROI'):
-            load_flags[0:2] = [True] * 2
-
-        return load_flags
-
-    def _load_data_from_disk(self, fig_params, load_flags, var_names):
-        """从磁盘加载数据"""
-        data = {}
-        base_path = os.path.join(fig_params['pathname'], fig_params['filename'])
-
-        for idx, flag in enumerate(load_flags[:7]):
-            if flag:
-                var_name = var_names[idx]
-                file_path = f"{base_path}.{var_name}"
-
-                try:
-                    with open(file_path, 'rb') as f:
-                        if np.isinf(fig_params.get('elements', 0)):
-                            data[var_name] = np.fromfile(f, dtype=np.float64)
-                        else:
-                            f.seek(fig_params.get('startPnt', 0) * 8)
-                            data[var_name] = np.fromfile(
-                                f, dtype=np.float64,
-                                count=fig_params.get('elements', 0)
-                            )
-                except FileNotFoundError:
-                    print(f"Warning: {file_path} not found")
-                    data[var_name] = np.array([])
-
-        return data
-
-    def _apply_roi_filter(self, data, load_flags, roi, var_names):
-        """应用ROI过滤"""
-        if load_flags[0] and load_flags[1]:
-            x, y = data[var_names[0]], data[var_names[1]]
-            mask = (
-                    (x > roi[0]) &
-                    (x < roi[0] + roi[2]) &
-                    (y > roi[1]) &
-                    (y < roi[1] + roi[3])
-            )
-
-            for idx, flag in enumerate(load_flags):
-                if flag and idx < len(var_names):
-                    data[var_names[idx]] = data[var_names[idx]][mask]
-
-        return data
-
-    def _calculate_metrics(self, data, fig_params, return_flags):
-        """计算衍生指标"""
-        if 'radius' in data and 'signal' in data:
-            # 计算光子数
-            cnts_per_photon = fig_params.get('cntsPerPhoton', 1.0)
-            data['photons'] = data['signal'] * 2 * np.pi * data['radius'] ** 2 / cnts_per_photon
-
-            # 计算定位精度
-            if return_flags[8] or fig_params.get('isThreshLocPrec', False):
-                px_size = fig_params.get('pxSize', 0.1)
-                data['precision'] = self.calc_loc_precision(
-                    data['radius'], px_size,
-                    data['photons'], data['noise'] / cnts_per_photon
-                )
-
-            # 计算SNR/SBR
-            if return_flags[9] or fig_params.get('isThreshSNR', False):
-                data['snr'] = data['signal'] / data['noise']
-
-            if return_flags[10]:
-                data['sbr'] = data['signal'] / data['offset']
-
-        return data
-
-    def _apply_thresholds(self, data, fig_params, load_flags, return_flags, var_names):
-        """应用阈值过滤"""
-        thresh_loc = fig_params.get('isThreshLocPrec', False)
-        thresh_snr = fig_params.get('isThreshSNR', False)
-
-        if thresh_loc or thresh_snr:
-            mask = np.ones(len(data.get(var_names[0], [])), dtype=bool)
-
-            if thresh_loc and thresh_snr:
-                min_loc = fig_params.get('minLoc', 0) / 1000
-                max_loc = fig_params.get('maxLoc', 1000) / 1000
-                min_snr = fig_params.get('minSNR', 0)
-                max_snr = fig_params.get('maxSNR', 100)
-                mask = (
-                        (data['precision'] > min_loc) &
-                        (data['precision'] < max_loc) &
-                        (data['snr'] > min_snr) &
-                        (data['snr'] < max_snr)
-                )
-            elif thresh_loc:
-                min_loc = fig_params.get('minLoc', 0) / 1000
-                max_loc = fig_params.get('maxLoc', 1000) / 1000
-                mask = (
-                        (data['precision'] > min_loc) &
-                        (data['precision'] < max_loc)
-                )
-            elif thresh_snr:
-                min_snr = fig_params.get('minSNR', 0)
-                max_snr = fig_params.get('maxSNR', 100)
-                mask = (
-                        (data['snr'] > min_snr) &
-                        (data['snr'] < max_snr)
-                )
-
-            for idx in range(len(load_flags)):
-                if idx < len(var_names) and var_names[idx] in data:
-                    data[var_names[idx]] = data[var_names[idx]][mask]
-
-        return data
-
-    def _apply_density_filter(self, data, fig_params, load_flags, return_flags, var_names):
-        """应用密度过滤"""
-        if fig_params.get('isThreshDensity', False) or return_flags[11]:
-            cluster_params = ['clusterScore', 'clusterRadius', 'clusterWeights']
-
-            if not all(k in fig_params for k in cluster_params):
-                data, tree = self.density_based_clustering(data)
-                del tree  # 手动释放内存
-
-                fig_params.update({
-                    'clusterScore': data.get('clusterScore'),
-                    'clusterRadius': data.get('clusterRadius'),
-                    'clusterWeights': data.get('clusterWeights'),
-                    'cluster': data.get('cluster')
-                })
-            else:
-                # 应用已有聚类结果
-                start = fig_params.get('startPnt', 0)
-                elements = fig_params.get('elements', np.inf)
-                cluster = fig_params['cluster']
-
-                if np.isinf(elements):
-                    good = slice(start, None)
-                else:
-                    good = slice(start, start + elements)
-
-                cluster_mask = cluster[good] > 0 if fig_params.get('clusterMode', 1) == 1 else cluster[good] == 0
-
-                for idx in range(len(load_flags)):
-                    if idx < len(var_names) and var_names[idx] in data:
-                        data[var_names[idx]] = data[var_names[idx]][cluster_mask]
-
-        return data
-
-    def _cleanup_fields(self, data, return_flags, var_names):
-        """清理不需要的字段"""
-        for idx, flag in enumerate(return_flags):
-            if not flag and idx < len(var_names):
-                data.pop(var_names[idx], None)
-        return data
-
-
-    def density_based_clustering(self, data):
-        """密度聚类实现"""
-        # 简化版DBSCAN实现
-        points = np.vstack([data['ctrsX'], data['ctrsY']]).T
-        tree = cKDTree(points)
-
-        # 这里需要实现具体的聚类算法
-        # 示例: 使用固定半径搜索
-        clusters = np.zeros(len(points))
-        cluster_id = 1
-
-        for i in range(len(points)):
-            if clusters[i] == 0:
-                neighbors = tree.query_ball_point(points[i], 0.1)  # 示例半径
-                if len(neighbors) > 5:  # 示例最小点数
-                    clusters[neighbors] = cluster_id
-                    cluster_id += 1
-
-        data['cluster'] = clusters
-        return data, tree
-
-    def render_image_data(self, data, roi):
-        """Placeholder for the rendering logic."""
-        # For demonstration, simply return the data as is
-        return data  # Replace this with actual rendering logic
-
-    def apply_colormap(self, image, width):
-        """Apply colormap to the rendered image."""
-        # Implement colormap application logic here
-        return image  # Replace this with actual colormap logic
-
-    def build_movie(self):
-        """Build a movie based on the current settings."""
-        preview_fig = tk.Toplevel(self.master)
-        preview_fig.title("Movie Preview")
-
-        # Ask user to accept movie settings
-        answer = messagebox.askyesno("Question", "Accept movie settings?")
-        if not answer:
-            return
-
-        movie_name = filedialog.asksaveasfilename(defaultextension=".avi", filetypes=[("AVI files", "*.avi")])
-        if not movie_name:
-            return
-
-        h_progressbar = tk.Toplevel(self.master)
-        h_progressbar.title("Progress")
-
-        # Use grid for layout
-        tk.Label(h_progressbar, text="Generating Movie...").grid(row=0, column=0, padx=10, pady=10)
-
-        progress = ttk.Progressbar(h_progressbar, length=200, mode='determinate')
-        progress.grid(row=1, column=0, padx=10, pady=10)
-
-        # Placeholder for movie creation logic
-        for i in range(100):  # Dummy loop for movie frames
-            # Simulate frame rendering
-            self.master.update_idletasks()
-            progress['value'] = i + 1
-
-        h_progressbar.destroy()
-        messagebox.showinfo("Info", "Movie generation complete.")
 
     ####################################max_proj和rve_proj投影
     def max_projection(self):
@@ -5847,10 +4468,10 @@ class SlimFastApp:
         fig = self.master
         roi = self.get_roi()
 
-        # # 直接使用ROI值来定义区域的边界
-        roi_y_start, roi_x_start, roi_height, roi_width = roi
-        roi_y_end = roi_y_start + roi_height
+        # # 直接使用ROI值来定义区域的边界（roi 格式为 [x0, y0, w, h]）
+        roi_x_start, roi_y_start, roi_width, roi_height = roi
         roi_x_end = roi_x_start + roi_width
+        roi_y_end = roi_y_start + roi_height
 
 
         # 处理 pathname 和 filename 的元组/列表包装
@@ -5924,7 +4545,7 @@ class SlimFastApp:
     def get_roi(self):
         """获取ROI区域"""
         if self.image_bin['h_roi'] is None:
-            return [0, 0, self.image_bin['height'], self.image_bin['width']]
+            return [0, 0, self.image_bin['width'], self.image_bin['height']]
         roi = np.ceil(self.image_bin['roi']).astype(int)
         return roi.tolist() ##确保返回的列表
 
@@ -5991,6 +4612,9 @@ class SlimFastApp:
 
     def process_superstack(self, image_paths, region, progress_bar, proj_type):
         """处理超栈"""
+        # region 顺序为 (y_start, y_end, x_start, x_end)，转为 crop 所需的 (x_start, y_start, x_end, y_end)
+        roi_y_start, roi_y_end, roi_x_start, roi_x_end = region
+        crop_box = (roi_x_start, roi_y_start, roi_x_end, roi_y_end)
         try:
             total_frames = sum(self.image_bin['stack_size'])
             frame_count = 0
@@ -6010,7 +4634,7 @@ class SlimFastApp:
                             messagebox.showerror("Error", f"Invalid frame {frame_idx} in image.")
                             return None
 
-                        frame_data = np.array(img.crop(region))
+                        frame_data = np.array(img.crop(crop_box))
 
                         # 使用普通索引替代切片
                         if proj_type == 'max':
@@ -6056,7 +4680,8 @@ class SlimFastApp:
 
         window = tk.Toplevel(self.master)
         window.title(f"{title_map[proj_type]} - {self.image_bin['filename']}")
-        window.geometry('320x320')
+        h, w = image.shape[:2]
+        window.geometry(f"{w}x{h + 50}")
 
         # 显示图像
         img_tk = ImageTk.PhotoImage(Image.fromarray(image))
@@ -6191,22 +4816,23 @@ class SlimFastApp:
                     hi = np.nanmax(v)
                 if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
                     # 全是常数或无效值：给固定大小
-                    size = np.full_like(raw_size, 12.0, dtype=np.float64)
+                    size = np.full_like(raw_size, 3.0, dtype=np.float64)
                 else:
                     v_clipped = np.clip(raw_size, lo, hi)
                     norm = (v_clipped - lo) / (hi - lo)  # 归一化到 [0,1]
 
                     # —— 映射到合理的 marker 面积区间（points^2） —— #
-                    S_MIN, S_MAX = 6.0, 48.0  # 点还大就把 48 改小，比如 36
+                    S_MIN, S_MAX = 2.0, 8.0  # 保持小散点，同时提高可见度
                     size = S_MIN + norm * (S_MAX - S_MIN)
             else:
-                size = np.full_like(raw_size, 12.0, dtype=np.float64)
+                size = np.full_like(raw_size, 3.0, dtype=np.float64)
         else:
-            size = 20.0
+            size = 3.0
         color = (self.image_bin[varNames[selected[3]]] * weights[3]
                  if selected[3] < len(varNames) else None)
 
-        scatter = ax.scatter(x, y, s=size, c=color, cmap='viridis', alpha=0.7)
+        scatter = ax.scatter(x, y, s=size, c=color, cmap='viridis', alpha=0.7,
+                             edgecolors='none', linewidths=0)
         ax.set_xlabel(self.encode_type[selected[0]])
         ax.set_ylabel(self.encode_type[selected[1]])
         # ax.set_aspect('equal', 'box')
@@ -6269,8 +4895,8 @@ class SlimFastApp:
             # —— 覆盖确认 —— #
             if os.path.exists(save_path):
                 overwrite = messagebox.askyesno(
-                    "文件已存在",
-                    f"文件 {os.path.basename(save_path)} 已存在。\n是否覆盖？"
+                    "File already exists",
+                    f"File {os.path.basename(save_path)} already exists.\nOverwrite?"
                 )
                 if not overwrite:
                     return
@@ -6471,317 +5097,62 @@ class SlimFastApp:
         fig_new.grid_columnconfigure(0, weight=1)
 
 
-    def interaction_study(self):
-        """Placeholder for interaction study functionality."""
-        messagebox.showinfo("Information", "Interaction Study function is not implemented.")
-
-    def coloc_filter(self):
-        """Open co-localization filter process."""
-        # 获取通道参数
-        imCh = self.image_bin['imCh']
-        nImCh = self.image_bin['nImCh']
-        roi=self.image_bin['roi']
-
-        # Load data for each channel
-        data = []
-        for ch in range(nImCh):
-            # 构造每个通道的fig_params
-            fig_params = {
-                'pathname': self.image_bin[f'ch{ch}_pathname'],
-                'filename': self.image_bin[f'ch{ch}_filename'],
-                'elements': self.image_bin[f'ch{ch}_elements'],
-                'startPnt': self.image_bin[f'ch{ch}_startPnt'],
-                'cntsPerPhoton': self.image_bin.get('cntsPerPhoton', 1.0),
-                'pxSize': self.image_bin.get('pxSize', 0.1),
-                'isThreshDensity': self.image_bin.get('isThreshDensity', False),
-                'isThreshSNR': self.image_bin.get('isThreshSNR', False),
-                'isThreshLocPrec': self.image_bin.get('isThreshLocPrec', False),
-                'hROI': self.image_bin.get('hROI', None)
-            }
-
-            # 设置通道特定的return_flags
-            return_val = [1, 1, 1, 1, 0, 0, 0, 1, 1, 0, 0, 0]  # 示例值
-
-            # 调用preprocess_data
-            channel_data = self.preprocess_data(
-                fig_params=fig_params,
-                return_flags=return_val,
-                roi=roi
-            )
-            data.append(channel_data)
-
-        # Simulate processing for co-localization
-        hProgressbar = tk.Toplevel(self.master)
-        hProgressbar.title("Processing")
-
-        progress = tk.StringVar(value="Generating Images...")
-        tk.Label(hProgressbar, textvariable=progress).grid(row=0, column=0, padx=10, pady=10)
-
-        nColoc = []
-        for frame in range(1, 11):  # Example frame range
-            idx1, idx2 = self.filter_data(data, frame)
-            nColoc.append(len(idx1))
-            self.generate_images(data, idx1, idx2, frame)
-
-            # Update progress
-            progress.set(f"Generating Images... Frame {frame}/10")
-            hProgressbar.update_idletasks()
-
-        hProgressbar.destroy()
 
 
-    def filter_data(self, data, frame):
-        """Filter data based on the current frame."""
-        good1 = (data[0]['frame'] == frame)
-        good2 = (data[1]['frame'] == frame)
-
-        y_diff = np.subtract.outer(data[0]['ctrsY'][good1], data[1]['ctrsY'][good2]) ** 2
-        x_diff = np.subtract.outer(data[0]['ctrsX'][good1], data[1]['ctrsX'][good2]) ** 2
-        d = np.sqrt(y_diff + x_diff)
-
-        thresh = 2  # Max allowed distance [px]
-        idx1, idx2 = np.where(d <= thresh)
-        return idx1, idx2
-
-    def generate_images(self, data, idx1, idx2, frame):
-        """Generate images based on co-localization indices."""
-        # Placeholder for image generation logic
-        pass
 
 
-    def particle_image_correlation(self):
-        fig = self.master  # Current figure reference
 
-        # Set correlation sampling rate
-        sampling_rate = 5  # [px^-1]
-        d_max = 15  # [px]
 
-        roi = self.image_bin['roi']
-        roi = [
-            max(roi[0], d_max),
-            max(roi[1], d_max),
-            min(roi[2], self.image_bin['width'] - d_max),
-            min(roi[3], self.image_bin['height'] - d_max)
-        ]
 
-        n_im = len(self.image_bin['ctrsN'])
-        n_pnts = len(self.image_bin['ctrsX'])
-
-        # Generate 2D-projected tree
-        pnt_list = np.column_stack((self.image_bin['ctrsX'], self.image_bin['ctrsY']))
-        tree = cKDTree(pnt_list)
-
-        # Average particle count for increasing dt
-        pnts_per_frame = np.bincount(self.image_bin['frame'])
-        mu_pnts = np.zeros(n_im - 1)
-
-        for dt in range(1, n_im):
-            mu_pnts[dt - 1] = np.mean(pnts_per_frame[dt:n_im])
-
-        C_cum = np.zeros((d_max, n_im - 1))
-
-        for d in range(1, int(np.ceil(d_max * sampling_rate)) + 1):
-            # Reset count matrix
-            cnts = np.zeros((n_pnts, n_im - 1))
-
-            for pnt in range(n_pnts):
-                idx = tree.query_ball_point(pnt_list[pnt], d / sampling_rate)
-                dt = self.image_bin['frame'][idx] - self.image_bin['frame'][pnt]
-                good = dt > 0
-
-                if np.any(good):
-                    # Overlap integral for image pairs separated by dt
-                    cnts[pnt, :] = np.bincount(dt[good], minlength=n_im - 1)
-
-            # Average over n*dt and normalize to average particle count for n*dt
-            C_cum[d - 1, :] = np.sum(cnts, axis=0) / mu_pnts
-
-        # Calculate spatial correction term
-        z = []
-        x = []
-        y = []
-        for dt in range(1, n_im):
-            lin_start = np.argmax(C_cum[:, dt - 1] > 1)
-            z.extend(C_cum[lin_start:, dt - 1])
-            y.extend(((lin_start + np.arange(d_max)) / sampling_rate).tolist())
-            x.extend([dt] * (d_max - lin_start))
-
-        # Perform regression
-        X = np.column_stack((np.ones(len(x)), x, np.array(y) ** 2))
-        b, _, _, _ = np.linalg.lstsq(X, z, rcond=None)
-
-        # Generate fitted surface
-        X_fit, Y_fit = np.meshgrid(np.arange(1, n_im),
-                                   (np.arange(1, int(np.ceil(d_max * sampling_rate))) / sampling_rate) ** 2)
-        Z_hat = b[1] * X_fit + b[2] * Y_fit
-
-        # Adjust C_cum
-        C_cum -= Z_hat
-
-        # Plot results
-        self.plot_results(X_fit, Y_fit, C_cum, z, x, y)
-
-    def plot_results(self, X_fit, Y_fit, C_cum, z, x, y):
-        """Plot the results of the correlation analysis."""
-        fig = plt.figure()
-        ax = fig.add_subplot(111, projection='3d')
-
-        ax.plot_surface(X_fit, Y_fit, C_cum, edgecolor='flat', alpha=0.9)
-        ax.scatter(x, np.array(y) ** 2, z, color='m', marker='.')
-        ax.set_xlabel('dt')
-        ax.set_ylabel('Distance (px)')
-        ax.set_zlabel('Cumulative Correlation')
-
-        plt.show()
 
     def localization(self):
-        """Run the localization process on the selected image."""
-        # Construct the full image path
-        self.image_bin['image_name'] = f"{self.image_bin['pathname']}/{self.image_bin['filename']}"
+        """Run the localization process on the loaded image stack (new localize_particles path)."""
+        # 1. 解析完整 TIFF 路径
+        full_path = self.image_bin.get('image_path')
+        if not full_path:
+            pn = self.image_bin.get('pathname', '')
+            fn = self.image_bin.get('filename', '')
+            if pn and fn:
+                full_path = os.path.join(pn, fn)
+        if not full_path or not os.path.isfile(full_path):
+            messagebox.showerror("Error", "Original TIFF path not found")
+            return
 
-        # Select output filename for localization results
-        if isinstance(self.image_bin['filename'], list):
-            cnt = 1
-            while all(self.image_bin['filename'][0].startswith(fn) for fn in self.image_bin['filename']):
-                cnt += 1
-            self.image_bin['filename'] = self.image_bin['filename'][0][:cnt - 1]
-        else:
-            self.image_bin['filename'] = self.image_bin['filename'][:-4]
+        # 2. 补齐 localize_particles 需要的字段
+        self.image_bin['imageName'] = full_path
+        self.image_bin['pathname'], self.image_bin['filename'] = os.path.split(full_path)
 
-        # Check ROI
-        if not self.image_bin['roi']:
-            self.image_bin['roi'] = [0, 0, self.image_bin['width'], self.image_bin['height']]
+        # 3. 读入整个 stack，形状 (frames, height, width)
+        stack = _safe_load_tiff(full_path)
+        total_frames = stack.shape[0]
 
-        # Run localization logic (this needs to be implemented)
-        self.run_localization()
+        # 4. 帧范围（1-based，与 localize_particles 内部 stack[t-1] 对应）
+        start_pnt = int(self.image_bin.get('locStart', 1))
+        loc_end = self.image_bin.get('locEnd', float('inf'))
+        end_pnt = total_frames if loc_end == float('inf') else int(loc_end)
+        start_pnt = max(1, min(start_pnt, end_pnt))
+        end_pnt = min(end_pnt, total_frames)
 
-    def run_localization(self):
-        """执行定位算法，并保存结果到指定的 output_filename."""
-        start_time = time.time()
-        loc_parallel = self.image_bin.get('locParallel', False)
+        # 5. ROI → 0-based 切片区间（主窗口 roi 为 [x0, y0, w, h]，0 起）
+        roi = self.image_bin.get('roi') or [0, 0, self.image_bin['width'], self.image_bin['height']]
+        x0, y0, roi_w, roi_h = roi
+        x0_py, y0_py = x0, y0
+        x1_py = x0_py + roi_w
+        y1_py = y0_py + roi_h
 
-        # 设置数据容器，用于并行或线性处理
-        data = []
-        ctrsN = []
-        file=self.image_bin['pathname']
-        self.image_bin['imageName']=file
-        info=imread(file)
-        end_pnt=info.shape[0]
+        # 6. 调用新版定位（内部会保存 _locs.txt 并返回每帧计数）
+        self.image_bin['ctrsN'] = self.localize_particles(
+            self.image_bin, start_pnt, end_pnt, stack, x0_py, y0_py, x1_py, y1_py
+        )
 
-        # 获取去掉扩展名的文件名
+        # 7. 计算实际保存的文件名与路径，并在对话框中展示
         filename_without_ext = os.path.splitext(self.image_bin['filename'])[0]
-
-
-        # 拼接完整路径
-        output_path = os.path.join(self.image_bin['pathname'], filename_without_ext)
-
-        if loc_parallel:
-            # 并行处理模式
-            num_frames = end_pnt - self.image_bin['locStart'] + 1
-            with ProcessPoolExecutor(max_workers=self.image_bin['nCores']) as executor:
-                futures = [
-                    executor.submit(self.localize_particles_Loc_all, self.image_bin, frame, end_pnt, None)
-                    for frame in range(self.image_bin['locStart'], end_pnt + 1)
-                ]
-                for future in futures:
-                    result = future.result()
-                    data.append(result[0])  # 假设结果的第一个元素是数据
-                    ctrsN.append(result[3])  # 假设结果的第4个元素是粒子检测信息
-
-        else:
-            # 线性处理模式
-            for frame in range(self.image_bin['locStart'] - 1, end_pnt):
-                result = self.localize_particles_Loc_all(self.image_bin, frame, end_pnt, info,output_path)
-                data.append(result[0])
-                ctrsN.append(result[3])
-
-        # elapsed_time = time.time() - start_time
-        # print(f"Localization took {elapsed_time:.2f} seconds.")
-        messagebox.showinfo("Success", "Localization completed and results saved.")
-
-    def localize_particles_Loc_all(self, image_bin, start_pnt, end_pnt, info,output_path):
-        """Run localization on the specified image with the given parameters."""
-        imagename = image_bin['imageName']
-        region = [
-            [image_bin['roi'][1], image_bin['roi'][1] + image_bin['roi'][3] - 1],
-            [image_bin['roi'][0], image_bin['roi'][0] + image_bin['roi'][2] - 1]
-        ]
-
-        # Initialize optim based on image_bin parameters
-        optim = [
-            image_bin['maxOptimIter'],
-            image_bin['termTol'],
-            image_bin['isRadiusTol'],
-            image_bin['radiusTol'],
-            image_bin['posTol']
-        ]
-
-        if image_bin['locParallel']:
-            data = [None] * (end_pnt - start_pnt + 1)
-            ctrsN = [None] * (end_pnt - start_pnt + 1)
-
-            with ProcessPoolExecutor(max_workers=image_bin['nCores']) as executor:
-                # 并行/线性处理前打印
-                futures = []
-                for frame in range(start_pnt, end_pnt + 1):
-                    futures.append(executor.submit(self.detect_et_estime_part_1vue_deflt, imagename, frame, region))
-
-                for i, future in enumerate(futures):
-                    data[i], deflatedIm, binaryIm, ctrsN[i] = future.result()
-
-
-            # 获取去掉扩展名的文件名
-            filename_without_ext = os.path.splitext(image_bin['filename'])[0]
-            # 拼接完整路径
-            output_path = os.path.join(image_bin['pathname'], filename_without_ext)
-            self.stream_to_disk(data, output_path)
-
-        else:  # Linear computation
-            ctrsN = []
-            data = []
-            for frame in range(start_pnt - 1, end_pnt):
-                print(f"frame {frame}")
-                f = tifffile.imread(imagename)
-                I = f[frame, :, :]
-                # I = imread(imagename)  # Load the image for the current frame
-                data_frame, deflatedIm, binaryIm, n_ctrs = self.detect_et_estime_part_1vue_deflt(
-                    I, image_bin['w2d'],
-                    self.image_bin['psfStd'],
-                    chi2.ppf(1 - 1 / 10 ** (image_bin['errorRate'] * -1), 1),
-                    image_bin['dfltnLoops'],
-                    image_bin['roi'][2],
-                    image_bin['roi'][3],
-                    image_bin['minInt'],
-                    optim  # Use the initialized optim
-                )
-                # print(f"现在frame是：{frame}.现在的n_ctrs:{n_ctrs}")
-                data.append(data_frame)
-                ctrsN.append(n_ctrs)
-
-            filename_without_ext = os.path.splitext(image_bin['filename'])[0]
-
-            # 拼接完整路径
-            output_path = os.path.join(image_bin['pathname'], filename_without_ext + '_locs.txt')
-            self.stream_to_disk(data, output_path)
-        return ctrsN
-
-
-    def check_name_existence(filename, pathname):
-        """
-        Check if the file with the given filename already exists in the folder.
-        If it exists, modify the filename by appending an index.
-        Returns (filename, pathname, abort).
-        """
-        abort = False
-        full_path = os.path.join(pathname, filename + '.mat')
-        counter = 1
-        new_filename = filename
-        while os.path.exists(full_path):
-            new_filename = f"{filename}_{counter}"
-            full_path = os.path.join(pathname, new_filename + '.mat')
-            counter += 1
-        return new_filename, pathname, abort
-
+        saved_file = filename_without_ext + '_locs.txt'
+        saved_path = os.path.join(self.image_bin['pathname'], saved_file)
+        messagebox.showinfo(
+            "Success",
+            f"Localization completed.\n\nFile name: {saved_file}\nFile path: {saved_path}"
+        )
 
     def show_image(self, parent, image_data):
         """在指定父容器显示图像"""
@@ -7220,10 +5591,10 @@ class SlimFastApp:
                 'minInt': float(self.intensity_thres_entry.get()),
                 'locParallel': self.use_parallel_var.get(),  # 直接引用
                 'nCores': self.n_cores_var.get(),
-                'isRadiusTol': self.image_bin.get('isRadiusTol', True),
+                'isRadiusTol': self.radius_tol_var.get(),
                 'radiusTol': float(self.radius_tol_entry.get()),
                 'posTol': float(self.pos_tol_entry.get()),
-                'maxOptimIter': int(self.image_bin.get('maxOptimIter', 100)),
+                'maxOptimIter': int(self.max_iter_entry.get()),
                 'termTol': float(self.term_tol_entry.get()),
 
                 # Bar Options
@@ -7276,70 +5647,7 @@ class SlimFastApp:
             # info = imread(file)
             #读取为内存映射的多帧数组
             # stack=tifffile.memmap(file)
-            def safe_load_tiff(path):
-                import tifffile, numpy as np
-
-                def rgb_to_gray(a):
-                    """Convert RGB/RGBA arrays to grayscale while preserving frame axes."""
-                    rgb = a[..., :3].astype(np.float64, copy=False)
-                    return (
-                        0.2989 * rgb[..., 0]
-                        + 0.5870 * rgb[..., 1]
-                        + 0.1140 * rgb[..., 2]
-                    )
-
-                with tifffile.TiffFile(path) as tif:
-                    comp = tif.pages[0].compression
-                    comp_name = comp.name if hasattr(comp, 'name') else str(comp)
-                    n_pages = len(tif.pages)
-                    print(f"Compression: {comp_name}  | pages={n_pages}")
-                    try:
-                        arr = tif.asarray()  # 保证页数正确
-                    except Exception as e:
-                        print(f"[warn] tif.asarray failed: {e}; fallback to imread")
-                        arr = tifffile.imread(path)
-
-                if arr.ndim == 2:
-                    stack = arr[np.newaxis, ...]
-                elif arr.ndim == 3:
-                    # Single-page RGB/RGBA TIFFs are read as (height, width, channels).
-                    # Localization expects (frames, height, width), so convert to one
-                    # grayscale frame instead of mistaking channels for image width.
-                    if arr.shape[-1] in (3, 4) and n_pages == 1:
-                        stack = rgb_to_gray(arr)[np.newaxis, ...]
-                    elif arr.shape[0] == n_pages:
-                        stack = arr
-                    elif arr.shape[-1] == n_pages and n_pages > 1:
-                        stack = np.moveaxis(arr, -1, 0)
-                    else:
-                        k = [i for i, s in enumerate(arr.shape) if s == n_pages]
-                        stack = np.moveaxis(arr, k[0], 0) if k else arr
-                elif arr.ndim >= 4:
-                    # Common multi-page RGB/RGBA layout: (frames, height, width, channels).
-                    if arr.shape[-1] in (3, 4):
-                        stack = rgb_to_gray(arr)
-                        if stack.ndim == 2:
-                            stack = stack[np.newaxis, ...]
-                    else:
-                        if arr.shape[0] == n_pages:
-                            stack = arr
-                        elif arr.shape[-1] == n_pages and n_pages > 1:
-                            stack = np.moveaxis(arr, -1, 0)
-                        else:
-                            k = [i for i, s in enumerate(arr.shape) if s == n_pages]
-                            stack = np.moveaxis(arr, k[0], 0) if k else arr
-                        while stack.ndim > 3:
-                            stack = stack[:, :, :, 0]  # 丢多余通道
-                else:
-                    raise RuntimeError(f"Unsupported TIFF shape: {arr.shape}")
-
-                if stack.ndim != 3:
-                    raise RuntimeError(f"Unsupported TIFF stack shape after loading: {stack.shape}")
-
-                T, H, W = stack.shape[:3]
-                return stack
-
-            stack = safe_load_tiff(file)
+            stack = _safe_load_tiff(file)
 
             # Split the image path and update pathname and filename
             self.image_bin['pathname'], self.image_bin['filename'] = os.path.split(self.image_bin['imageName'])
@@ -7370,20 +5678,8 @@ class SlimFastApp:
             y1_py=y0_py+roiHeight
             # Call localization function
             self.image_bin['ctrsN'] = self.localize_particles(self.image_bin, start_pnt, end_pnt, stack,x0_py,y0_py,x1_py,y1_py)
-            # 获取去掉扩展名的文件名
-            filename_without_ext = os.path.splitext(self.image_bin['filename'])[0]
-
-            # 拼接完整路径
-            output_path = os.path.join(self.image_bin['pathname'], filename_without_ext)
-            output_mat = f"{output_path}.mat"
-
-
-            # 保存 localization matrix 到 .mat 文件
-            try:
-                sio.savemat(output_mat, {'imageBin': self.image_bin})
-            except Exception as e:
-                print("[ERROR] save .mat file failed:", str(e))
-                # 记录结束时间，计算耗时
+            # localize_particles writes the localization TXT and source association.
+            # No duplicate MATLAB imageBin export is needed by downstream steps.
             end_time = time.perf_counter()
             elapsed = end_time - start_time
             # print(f"[DEBUG] Finished processing {file!r} in {elapsed:.2f} seconds")
@@ -7391,11 +5687,11 @@ class SlimFastApp:
             total_elapsed = time.perf_counter() - total_start_time
 
         print("\n" + "=" * 30)
-        print(f"批处理任务完成！")
-        print(f"处理文件总数: {file_count}")
-        print(f"总花费时间: {total_elapsed:.2f} 秒")
+        print(f"Batch processing completed!")
+        print(f"Total files processed: {file_count}")
+        print(f"Total time: {total_elapsed:.2f} seconds")
         if file_count > 0:
-            print(f"平均每个文件耗时: {total_elapsed / file_count:.2f} 秒")
+            print(f"Average time per file: {total_elapsed / file_count:.2f} seconds")
         print("=" * 30 + "\n")
         messagebox.showinfo("Info", "Batch processing done!")
 
@@ -7533,6 +5829,8 @@ class SlimFastApp:
                 filename_without_ext + '_locs.txt'
             )
             stream_to_disk(data, output_path)
+            self._remember_tracking_source(output_path, image_bin['imageName'], 0,
+                                           start_pnt - 1, stack.shape[1:])
 
             return ctrsN
 
@@ -7588,6 +5886,8 @@ class SlimFastApp:
                 filename_without_ext + '_locs.txt'
             )
             stream_disk(data, output_path)
+            self._remember_tracking_source(output_path, image_bin['imageName'], 0,
+                                           start_pnt - 1, stack.shape[1:])
         return ctrsN
 
     def stream_to_disk(self, data, output_path):
@@ -8210,7 +6510,201 @@ class SlimFastApp:
         output = [x[0], x[1], alpha, fval, m, x[2], 1]
         return output
 
-    def build_tracks(self):
+    def _remember_tracking_source(self, loc_path, image_path, frame_base, offset, shape):
+        try:
+            return tracking_source.save_record(loc_path, image_path, frame_base, offset, shape)
+        except OSError as e:
+            messagebox.showwarning(
+                "Source association not saved",
+                f"The TIFF can be used for this session, but its association could not be saved:\n{e}"
+            )
+            return None
+
+    def _prepare_tracking_source(self, expected_shape=None):
+        """Resolve, validate and remember the original TIFF before changing tracking data."""
+        loc_path = Path(self.image_bin['pathname'])
+        if loc_path.is_dir():
+            loc_path = loc_path / self.image_bin['filename']
+        loc_path = loc_path.resolve()
+        try:
+            record = self.image_bin.get('tracking_source_record')
+            if record is None:
+                record = tracking_source.read_record(loc_path)
+        except (OSError, ValueError) as e:
+            messagebox.showwarning("Source association", f"Cannot read the saved association:\n{e}")
+            record = {}
+        frames = np.asarray(self.image_bin['frame'])
+        if frames.ndim != 1 or not frames.size:
+            messagebox.showinfo("Tracking", "No localization points are available for tracking.")
+            return None
+        frame_base = record.get('frame_base')
+        if frame_base is None:
+            if np.any(frames == 0):
+                frame_base = 0
+            else:
+                # A missing frame 0 can mean no detections there; min(frame)==1 is not proof of 1-based numbering.
+                answer = messagebox.askyesnocancel(
+                    "Localization frame numbering",
+                    "The TXT contains no frame 0 and has no saved frame numbering.\n\n"
+                    "Does frame 1 mean the first TIFF frame?\n"
+                    "Yes: numbering starts at 1.\nNo: numbering starts at 0 (this program's TXT output).\n"
+                    "Cancel: return without changing data."
+                )
+                if answer is None:
+                    return None
+                frame_base = 1 if answer else 0
+        offset = record.get('source_frame_offset', 0)
+        try:
+            tracking_source.normalize_frames(frames, frame_base)
+        except ValueError as e:
+            messagebox.showerror("Tracking frame numbers", str(e))
+            return None
+        if expected_shape is None:
+            expected_shape = record.get('frame_shape')
+            if expected_shape is None and self.image_bin.get('image_dimensions_known', True):
+                expected_shape = (self.image_bin['height'], self.image_bin['width'])
+        candidates = [p for p in tracking_source.source_candidates(loc_path, record) if p.is_file()]
+        failure = "The original TIFF stack could not be found automatically."
+        while True:
+            if candidates:
+                filename = candidates.pop(0)
+            else:
+                messagebox.showinfo(
+                    "Original TIFF required",
+                    f"{failure}\n\nTracking uses original pixels to verify new trajectories. "
+                    "Select the original TIFF stack used to generate this TXT. "
+                    "A single PNG cannot replace it. Cancel leaves the data unchanged."
+                )
+                filename = filedialog.askopenfilename(
+                    title="Select original TIFF stack for tracking",
+                    initialdir=str(loc_path.parent),
+                    filetypes=[("TIFF image stacks", "*.tif *.tiff *.TIF *.TIFF")]
+                )
+                if not filename:
+                    return None
+            try:
+                source = tracking_source.load_validated_source(
+                    filename, frames, frame_base, offset, expected_shape
+                )
+            except Exception as e:
+                failure = f"Cannot use {filename}:\n{e}"
+                continue
+            saved = self._remember_tracking_source(
+                loc_path, source['path'], frame_base, offset, source['stack'].shape[1:]
+            )
+            # Keep the selection usable in memory even if the folder is read-only.
+            self.image_bin['tracking_source_record'] = saved or {
+                'absolute_path': source['path'], 'frame_base': frame_base,
+                'source_frame_offset': offset, 'frame_shape': list(source['stack'].shape[1:])
+            }
+            return source
+
+    def build_tracks(self, source=None):
+        """Start tracking without blocking Tk's event loop."""
+        running = getattr(self, '_tracking_thread', None)
+        if running is not None and running.is_alive():
+            messagebox.showinfo("Tracking", "Tracking is already running.")
+            return
+        if source is None:
+            source = self._prepare_tracking_source()
+        if source is None:
+            return
+
+        tracking_frames = tracking_source.normalize_frames(
+            self.image_bin['frame'], source['frame_base']
+        )
+        total_frames = int(tracking_frames.max()) + 1
+        progress_win = tk.Toplevel(self.master)
+        progress_win.title("Generating Trajectories")
+        progress_win.resizable(False, False)
+        progress_win.transient(self.master)
+
+        stage_var = tk.StringVar(value="Preparing tracking data...")
+        detail_var = tk.StringVar(value=f"0 / {total_frames} frames")
+        time_var = tk.StringVar(value="Elapsed: 0 s    Remaining: calculating...")
+        progress_var = tk.DoubleVar(value=0)
+        ttk.Label(progress_win, textvariable=stage_var).pack(anchor='w', padx=16, pady=(14, 5))
+        progress_bar = ttk.Progressbar(progress_win, variable=progress_var, maximum=total_frames,
+                                       length=420)
+        progress_bar.pack(fill='x', padx=16, pady=5)
+        ttk.Label(progress_win, textvariable=detail_var).pack(anchor='w', padx=16, pady=2)
+        ttk.Label(progress_win, textvariable=time_var).pack(anchor='w', padx=16, pady=(2, 8))
+
+        cancel_event = threading.Event()
+        cancel_button = ttk.Button(progress_win, text="Cancel")
+        cancel_button.pack(pady=(0, 14))
+        progress_queue = queue.Queue()
+        started = time.perf_counter()
+
+        def request_cancel():
+            if not cancel_event.is_set():
+                cancel_event.set()
+                stage_var.set("Cancelling after the current frame...")
+                cancel_button.config(state='disabled')
+
+        cancel_button.config(command=request_cancel)
+        progress_win.protocol("WM_DELETE_WINDOW", request_cancel)
+
+        def worker():
+            try:
+                result = self._compute_tracks(
+                    source, progress_callback=lambda done, total: progress_queue.put(
+                        ('progress', done, total)
+                    ), cancel_event=cancel_event
+                )
+                progress_queue.put(('done', result))
+            except Exception as exc:
+                progress_queue.put(('error', exc, traceback.format_exc()))
+
+        self._tracking_thread = threading.Thread(target=worker, name='SPT tracking', daemon=True)
+        self._tracking_thread.start()
+
+        def poll_progress():
+            terminal = None
+            try:
+                while True:
+                    event = progress_queue.get_nowait()
+                    if event[0] == 'progress':
+                        _, done, total = event
+                        elapsed = time.perf_counter() - started
+                        remaining = (elapsed / done * (total - done)) if done else None
+                        progress_bar.configure(maximum=total)
+                        progress_var.set(done)
+                        stage_var.set("Generating trajectories...")
+                        detail_var.set(f"{done} / {total} frames ({done / total * 100:.1f}%)")
+                        time_var.set(
+                            f"Elapsed: {elapsed:.0f} s    Remaining: "
+                            + (f"{remaining:.0f} s" if remaining is not None else "calculating...")
+                        )
+                    else:
+                        terminal = event
+            except queue.Empty:
+                pass
+
+            if terminal is None:
+                if progress_win.winfo_exists():
+                    progress_win.after(100, poll_progress)
+                return
+
+            if progress_win.winfo_exists():
+                progress_win.destroy()
+            if terminal[0] == 'error':
+                print(terminal[2])
+                messagebox.showerror("Tracking failed", str(terminal[1]))
+            elif terminal[1].get('cancelled'):
+                messagebox.showinfo("Tracking cancelled", "Trajectory generation was cancelled.")
+            else:
+                self._save_tracking_result(terminal[1])
+
+        progress_win.after(100, poll_progress)
+
+    def _compute_tracks(self, source, progress_callback=None, cancel_event=None):
+        if source is None:
+            raise ValueError("Original TIFF source is required for tracking.")
+        filename, stack = source['path'], source['stack']
+        tracking_frames = tracking_source.normalize_frames(self.image_bin['frame'], source['frame_base'])
+        source_offset = source['source_frame_offset']
+        self.image_bin['height'], self.image_bin['width'] = stack.shape[1:]
         # ================== 基本参数 ==================
         self.settings = {
             'Width': self.image_bin['width'],
@@ -8247,16 +6741,10 @@ class SlimFastApp:
         self.current_ids = []
         self.next_id = 0
 
-        ctrsN = np.array(self.image_bin['ctrsN'], dtype=int)
-        Nb_STK = len(ctrsN)
-        min_frame = int(np.min(self.image_bin['frame']))
-        max_frame = int(np.max(self.image_bin['frame']))
-        frames_count_from_frames = max_frame + 1
-        self.nb_stk = max(Nb_STK, frames_count_from_frames)
-
-        if len(ctrsN) < self.nb_stk:
-            ctrsN = np.pad(ctrsN, (0, self.nb_stk - len(ctrsN)), constant_values=0)
-            self.image_bin['ctrsN'] = ctrsN
+        # Tracking uses zero-based frame indices internally, independently of the TXT convention.
+        self.nb_stk = int(tracking_frames.max()) + 1
+        ctrsN = np.bincount(tracking_frames, minlength=self.nb_stk)
+        self.image_bin['ctrsN'] = ctrsN
 
         # MATLAB 是 1-based 的帧，这里沿用外层 1..nb_stk 的循环，但内部使用 0-based
         if self.image_bin.get('loc_start', 1) <= 1:
@@ -8270,10 +6758,7 @@ class SlimFastApp:
         r0 = self.image_bin['psf_std']
         seuil_alpha = self.image_bin['min_int']
 
-        filename = os.path.splitext(self.image_bin['pathname'])[0].replace('_locs', '') + '.tif'
-        stack = tifffile.imread(filename)
-        # stack = tifffile.memmap(filename)
-        self.im_t = stack[0]
+        self.im_t = stack[source_offset + start_point - 1]
         start_time = time.perf_counter()
 
         # # 进度条
@@ -8317,7 +6802,7 @@ class SlimFastApp:
             for iTraj in tab_traj:
                 # alpha
                 local_param = self.tab_param[iTraj, 7 * (self.t_red - 1) + 4]
-                self.tab_moy[iTraj, 7 * (self.t_red - 1) + 4] = local_param
+                self.tab_moy[iTraj, 7 * (self.t_red - 1) + 4] = local_param + 1j * local_param
                 self.tab_var[iTraj, 7 * (self.t_red - 1) + 4] = 0.2 * local_param
                 # r
                 local_param = self.tab_param[iTraj, 7 * (self.t_red - 1) + 5]
@@ -8332,8 +6817,10 @@ class SlimFastApp:
 
                 if new_flag:
                     # 兼容：再填充前一时刻一份
-                    self.tab_moy[iTraj, 7 * ((self.t_red - 1) - 1) + 4] = self.tab_param[
-                        iTraj, 7 * (self.t_red - 1) + 4]
+                    previous_alpha = self.tab_param[iTraj, 7 * (self.t_red - 1) + 4]
+                    self.tab_moy[iTraj, 7 * ((self.t_red - 1) - 1) + 4] = (
+                        previous_alpha + 1j * previous_alpha
+                    )
                     self.tab_var[iTraj, 7 * ((self.t_red - 1) - 1) + 4] = 0.2 * self.tab_param[
                         iTraj, 7 * (self.t_red - 1) + 4]
                     self.tab_moy[iTraj, 7 * ((self.t_red - 1) - 1) + 5] = self.tab_param[
@@ -8424,9 +6911,11 @@ class SlimFastApp:
         # ---------------------- 帧循环 ----------------------
         par_per_frame = []
         for t in range(start_point, end_point + 1):
+            if cancel_event is not None and cancel_event.is_set():
+                return {'cancelled': True}
             # print(f"当前处理到第 {t} 帧", flush=True)
             # 当前帧的检测
-            ind_valid = (self.image_bin['frame'] == (t - 1))
+            ind_valid = (tracking_frames == (t - 1))
             par_per_frame = np.array(self.image_bin['ctrsN'], copy=True)
             par_per_frame[t - 1] = np.sum(ind_valid)
 
@@ -8464,13 +6953,9 @@ class SlimFastApp:
                 #     continue
 
                 ncols = 1 + BLOCK * (self.t_red + 1)
-                # self.tab_param = np.zeros((n_init, ncols), dtype=float)
-                # self.tab_var = np.zeros_like(self.tab_param)
-                # self.tab_moy = np.zeros_like(self.tab_param)
-
-                # 预估最大可能的轨迹数，比如 n_init 的 5 倍，或者一个足够大的数如 10000
-                max_expected_trajs = max(int(n_init * 5), 10000)
-                self.tab_param = np.zeros((max_expected_trajs, ncols), dtype=float)
+                # 只为第一帧中实际存在的定位点创建轨迹行。
+                # 后续出现的新轨迹会在检测到时按需追加。
+                self.tab_param = np.zeros((n_init, ncols), dtype=float)
                 self.tab_var = np.zeros_like(self.tab_param)
                 self.tab_moy = np.zeros_like(self.tab_param)
 
@@ -8511,56 +6996,42 @@ class SlimFastApp:
                 if status_col < self.tab_var.shape[1]:
                     self.tab_var[:, status_col] = 2.0
 
-                self.tab_moy = self.tab_var.copy()
+                # MATLAB promotes tab_moy to complex when init_tab stores
+                # alpha_mean + 1i*alpha_max.
+                self.tab_moy = self.tab_var.astype(complex, copy=True)
 
                 # init 统计
                 init_tab(np.arange(0, n_init, dtype=int))
 
                 # 稳定 gid
-                M = self.tab_param.shape[0]
+                M = n_init
                 self.current_ids = list(range(self.next_id, self.next_id + M))
                 self.next_id += M
 
                 # 存第一帧
                 for track in range(M):
-                    status_idx = blk_col(1, self.t_red)
+                    block_idx = self.t_red - 1
+                    status_idx = blk_col(7, block_idx)
                     if self.tab_param[track, status_idx] > 0:
                         gid = self.current_ids[track]
-                        block_idx = self.t_red - 1
-                        if t > start_point:
-                            current_frame = t - 2  # 写出上一帧
-                        else:
-                            current_frame = t - 1  # 第一帧特例
 
-                        # ---- build row for tracked_table ----
                         i_val = self.tab_param[track, blk_col(2, block_idx)]  # i(y) 位置
                         j_val = self.tab_param[track, blk_col(3, block_idx)]  # j(x) 位置
-                        t_val = current_frame  # 帧号 (Python: 0-based)
-
-                        traj_id = gid  # 轨迹编号 (trackID)
-
+                        t_val = self.tab_param[track, blk_col(1, block_idx)] - 1
                         alpha = self.tab_param[track, blk_col(4, block_idx)]  # alpha = signal*sqrt(pi)*r
-
-                        nb_code = self.tab_var[track, blk_col(6, block_idx)]  # blink/nb 编码
-                        sig_ij = self.tab_var[track, blk_col(2, block_idx)]  # 位置方差 σ_ij
-                        n2 = self.tab_var[track, blk_col(4, block_idx)]  # 噪声方差 n²
+                        sig_b = self.tab_var[track, blk_col(6, block_idx)]
+                        sig_i = self.tab_var[track, blk_col(2, block_idx)]
+                        sig_alpha = self.tab_var[track, blk_col(4, block_idx)]
 
                         row = np.array([
-                            j_val,  # 列5 (j, x 坐标)
-                            i_val,  # 列4 (i, y 坐标)
-                            t_val,  # 列6 (帧号)
-                            traj_id,  # 列7 (轨迹 ID)
-                            alpha,  # 列8 (alpha)
-                            nb_code,  # 列9 (编码)
-                            sig_ij,  # 列10 (位置方差)
-                            n2  # 列11 (噪声方差)
+                            j_val, i_val, t_val, gid, alpha, sig_b, sig_i, sig_alpha
                         ], dtype=float)
 
                         self.trackStore[gid].append(row)
 
             # ---------- 后续帧 ----------
-            if t > start_point and getattr(self, 'tab_param', None) is not None and self.tab_param.size > 0:
-                im_t = stack[t - 1]
+            if t > start_point and getattr(self, 'tab_param', None) is not None:
+                im_t = stack[source_offset + t - 1]
                 self.im_t = im_t
 
                 blink_col = 7 * (self.t_red - 1) + 7
@@ -8579,7 +7050,9 @@ class SlimFastApp:
                     self.tab_moy[:, 0] = self.tab_param[:, 0]
 
                 # 排序（blink 降序）
-                part_ordre_blk = np.argsort(-self.tab_param[:, blink_col])
+                # MATLAB sort is stable: trajectories with the same status keep
+                # their existing order when competing for detections.
+                part_ordre_blk = np.argsort(-self.tab_param[:, blink_col], kind='stable')
 
                 # —— 本帧写入块统一为 write_block = self.t_red；在写入任何列之前，先扩列 —— #
                 cur_block = self.t_red - 1
@@ -8630,7 +7103,9 @@ class SlimFastApp:
                         cur_nb_col = blk_col(7, write_block)
                         self.tab_param[traj, cur_nb_col] = (self.tab_param[traj, prev_nb_col] - 1
                                                             if self.tab_param[traj, prev_nb_col] < 0 else -1)
-                        if cur_block - 1 >= 0:
+                        # MATLAB applies the ephemeral-detection check only
+                        # after the third 1-based frame.
+                        if t > 3 and cur_block - 1 >= 0:
                             two_back_nb_col = blk_col(7, cur_block - 1)
                             if (two_back_nb_col < self.tab_param.shape[1]) and (
                                     self.tab_param[traj, two_back_nb_col] == 0):
@@ -8703,20 +7178,23 @@ class SlimFastApp:
                     end_idx = blk_col(7, write_block)  # 最后一块的结束列
 
                     # 核心逻辑：直接把后面的列“挪”到前面，不需要申请新内存
-                    num_cols_to_shift = end_idx - start_idx
+                    # MATLAB's source range is inclusive at both ends. Python's
+                    # slice stop is exclusive, so include end_idx explicitly.
+                    num_cols_to_shift = end_idx - start_idx + 1
 
                     # 1. 移动 tab_param
-                    self.tab_param[:, 1: 1 + num_cols_to_shift] = self.tab_param[:, start_idx: end_idx]
+                    self.tab_param[:, 1: 1 + num_cols_to_shift] = self.tab_param[:, start_idx:end_idx + 1]
                     # 2. 移动 tab_var
-                    self.tab_var[:, 1: 1 + num_cols_to_shift] = self.tab_var[:, start_idx: end_idx]
+                    self.tab_var[:, 1: 1 + num_cols_to_shift] = self.tab_var[:, start_idx:end_idx + 1]
                     # 3. 移动 tab_moy
-                    self.tab_moy[:, 1: 1 + num_cols_to_shift] = self.tab_moy[:, start_idx: end_idx]
+                    self.tab_moy[:, 1: 1 + num_cols_to_shift] = self.tab_moy[:, start_idx:end_idx + 1]
 
-                    # 清空最后一块（刚挪走的空位）
+                    # MATLAB appends [t+1, zeros(1, 6)] to all three tables.
                     last_block_start = blk_col(1, write_block)
-                    self.tab_param[:, last_block_start: last_block_start + 7] = 0
-                    # 写入帧号
-                    self.tab_param[:, last_block_start] = (t - 1)
+                    for table_name in ('tab_param', 'tab_var', 'tab_moy'):
+                        table = getattr(self, table_name)
+                        table[:, last_block_start:last_block_start + BLOCK] = 0
+                        table[:, last_block_start] = t + 1
 
                 # 仅初始化新加入的行
                 new_nb_traj = self.tab_param.shape[0]
@@ -8733,30 +7211,26 @@ class SlimFastApp:
 
                 # ====== 写入 trackStore ====== #
                 for track in range(self.tab_param.shape[0]):
-                    status_col_here = blk_col(1, self.t_red)
+                    block_idx = self.t_red - 1
+                    status_col_here = blk_col(7, block_idx)
                     if status_col_here < self.tab_param.shape[1] and self.tab_param[track, status_col_here] > 0:
                         gid = self.current_ids[track]
-                        block_idx = self.t_red - 1
-                        if t > start_point:
-                            current_frame = t - 2
-                        else:
-                            current_frame = t - 1
-
-                        # 关键：检查这一帧是否真的有 localization
                         i_val = self.tab_param[track, blk_col(2, block_idx)]
                         j_val = self.tab_param[track, blk_col(3, block_idx)]
+                        current_frame = self.tab_param[track, blk_col(1, block_idx)] - 1
                         alpha = self.tab_param[track, blk_col(4, block_idx)]
+                        sig_b = self.tab_var[track, blk_col(6, block_idx)]
+                        sig_i = self.tab_var[track, blk_col(2, block_idx)]
+                        sig_alpha = self.tab_var[track, blk_col(4, block_idx)]
 
-                        # 如果 alpha == 0 (说明这一帧没有粒子，只是复制/空补)，就跳过
-                        if alpha == 0:
-                            continue
-
-                        nb_code = self.tab_param[track, blk_col(7, block_idx)]
-                        sig_ij = self.tab_var[track, blk_col(3, block_idx)]
-                        n2 = self.tab_var[track, blk_col(6, block_idx)]
-
-                        new_row = np.array([j_val, i_val, current_frame, gid, alpha, nb_code, sig_ij, n2], dtype=float)
+                        new_row = np.array(
+                            [j_val, i_val, current_frame, gid, alpha, sig_b, sig_i, sig_alpha],
+                            dtype=float
+                        )
                         self.trackStore[gid].append(new_row)
+
+            if progress_callback is not None:
+                progress_callback(t - start_point + 1, end_point - start_point + 1)
 
             # 进度
             # progress_var.set(t - start_point + 1)
@@ -8782,6 +7256,18 @@ class SlimFastApp:
         end_time = time.perf_counter()
         elapsed = end_time - start_time
 
+        return {
+            'cancelled': False,
+            'filename': filename,
+            'elapsed': elapsed,
+            'frames': self.settings['Frames'],
+            'tracks': len(self.trackStore),
+        }
+
+    def _save_tracking_result(self, result):
+        """Ask for an output path and save completed tracking results on Tk's thread."""
+        filename = result['filename']
+        elapsed = result['elapsed']
         file_path = filedialog.asksaveasfilename(defaultextension=".txt",
                                                  filetypes=[("Text files", "*.txt")],
                                                  initialfile=os.path.splitext(os.path.basename(filename))[0],
@@ -8796,17 +7282,14 @@ class SlimFastApp:
             base_name = os.path.splitext(os.path.basename(file_path))[0]
             new_file_name = os.path.join(pathname, f'{base_name}_table.txt')
             df.to_csv(new_file_name, sep='\t', index=False, header=False)
-            end_time = time.perf_counter()
-            elapsed = end_time - start_time
-
             # 1. 打印到控制台
             print("\n" + "=" * 40)
-            print(f"【Tracking 性能报告】")
-            print(f"处理文件: {os.path.basename(filename)}")
-            print(f"总计帧数: {self.settings['Frames']}")
-            print(f"生成的轨迹数: {len(self.trackStore)}")
-            print(f"总花费时间: {elapsed:.3f} 秒")
-            print(f"平均每帧耗时: {elapsed / self.settings['Frames']:.4f} 秒")
+            print(f"[Tracking Performance Report]")
+            print(f"Processed file: {os.path.basename(filename)}")
+            print(f"Total frames: {result['frames']}")
+            print(f"Generated tracks: {result['tracks']}")
+            print(f"Total time: {elapsed:.3f} seconds")
+            print(f"Average time per frame: {elapsed / result['frames']:.4f} seconds")
             print("=" * 40 + "\n")
 
             # 2. 修改弹窗提示，增加时间显示
@@ -8853,9 +7336,10 @@ class SlimFastApp:
             ind_boule = self.limite_combi_part_dst(traj, ind_boule, lest, t)
             nb_part_boule = ind_boule.size
 
-        # prepare vec_part: length = nb_traj, pad with -1
+        # Match MATLAB: keep every candidate when there are enough particles;
+        # only pad with blink markers when there are fewer particles than tracks.
         if nb_traj <= nb_part_boule:
-            vec_part = np.asarray(ind_boule[:nb_traj], dtype=int)
+            vec_part = np.asarray(ind_boule, dtype=int)
         else:
             padding = -1 * np.ones(nb_traj - nb_part_boule, dtype=int)
             vec_part = np.concatenate((ind_boule, padding)).astype(int)
@@ -8869,7 +7353,9 @@ class SlimFastApp:
     def n_plus_proche(self, ic, jc, liste_i, liste_j, N):
         # 计算每个点到 (ic, jc) 的平方距离
         sq_dist = (liste_i - ic) ** 2 + (liste_j - jc) ** 2
-        sq_dist_classe, ind_classe = np.sort(sq_dist), np.argsort(sq_dist)
+        # Preserve input order for equal distances, as MATLAB sort does.
+        ind_classe = np.argsort(sq_dist, kind='stable')
+        sq_dist_classe = sq_dist[ind_classe]
         if len(liste_i) > N:
             indice = ind_classe[:N]
             dist2 = sq_dist_classe[:N]
@@ -8911,8 +7397,12 @@ class SlimFastApp:
             return vec_traj_in[:getattr(self, 'Nb_combi', 1)]
 
         tab_blk = self.tab_param[vec_traj_in[1:], blink_col]
-        sorted_idx = np.argsort(tab_blk)[::-1]
-        keep_k = max(1, int(getattr(self, 'Nb_combi', 1)) - 1)
+        # Negating before a stable ascending sort gives a stable descending
+        # order. Reversing an ascending result would reverse equal values too.
+        sorted_idx = np.argsort(-tab_blk, kind='stable')
+        # The reference trajectory already occupies one competition slot.
+        # With Nb_combi == 1 MATLAB therefore keeps no additional trajectory.
+        keep_k = max(0, int(getattr(self, 'Nb_combi', 1)) - 1)
         selected = sorted_idx[:keep_k]
         selected_trajs = vec_traj_in[1:][selected]
         vec_traj_out = np.concatenate(([vec_traj_in[0]], selected_trajs))
@@ -9037,7 +7527,8 @@ class SlimFastApp:
                 dj = slice(max(0, pj - offset), min(w, pj - offset + wn))
                 im_part = im_t[di, dj]
 
-                sig2_h0 = np.var(im_part) if im_part.size > 0 else 1e-10
+                # MATLAB var(x) uses N-1 normalization for a non-scalar vector.
+                sig2_h0 = np.var(im_part, ddof=1) if im_part.size > 1 else 1e-10
                 # 简化公式：N * log(var_bg / var_peak)
                 results.append(n_pixels * math.log(max(1e-10, sig2_h0 / sig2_h1)))
             return np.array(results), None
@@ -9059,7 +7550,9 @@ class SlimFastApp:
         alphas = lest[part_indices, 3]
         val_moy_complex = self.tab_moy[traj, 7 * t + 4]
         alpha_moy = np.real(val_moy_complex)
-        alpha_max = np.imag(val_moy_complex) if np.imag(val_moy_complex) != 0 else alpha_moy
+        # The supplied MATLAB version explicitly uses alpha_moy here; the
+        # imaginary component is retained for mise_a_jour_tab statistics.
+        alpha_max = alpha_moy
         sig_alpha = max(1e-10, self.tab_var[traj, 7 * t + 4])
 
         # 高斯分布概率
@@ -9089,7 +7582,7 @@ class SlimFastApp:
 
         # D. 计算半径概率 (Lr) - 向量化
         rs = lest[part_indices, 5]
-        r_ref = self.tab_moy[traj, 7 * t + 5]
+        r_ref = float(np.real(self.tab_moy[traj, 7 * t + 5]))
         sig_r_ref = self.tab_var[traj, 7 * t + 5]
 
         if sig_r_ref > 1e-10:
@@ -9154,60 +7647,21 @@ class SlimFastApp:
         vec_traj = np.asarray(vec_traj, dtype=int).ravel()
         vec_part = np.asarray(vec_part).ravel()
 
-        # helper: map part -> valid python index or None
-        n_lest = int(lest.shape[0]) if hasattr(lest, 'shape') else 0
-
-        def is_valid_part(p):
-            try:
-                pv = int(p)
-            except Exception:
-                return False
-            return (pv >= 0 and pv <= n_lest - 1)
-
         # compute baseline using first nb_traj elements
         vec_part_ref = vec_part[:nb_traj]
         best_part = int(vec_part_ref[0]) if vec_part_ref.size > 0 else -1
         vrais = self.vrais_config_reconnex(vec_traj, vec_part_ref, t, lest, wn)
 
-        # try permutations up to a safe limit
-        max_exhaustive = 8
-        if vec_part.size <= max_exhaustive:
-            for perm in itertools.permutations(vec_part, r=nb_traj):
-                perm = np.asarray(perm)
-                vrais_tmp = self.vrais_config_reconnex(vec_traj, perm[:nb_traj], t, lest, wn)
-                if vrais_tmp > vrais:
-                    vrais = vrais_tmp
-                    best_part = int(perm[0])
-            return best_part
-        else:
-            # greedy fallback
-            assigned = set()
-            assignment = [-1] * nb_traj
-            # precompute per-(traj,part) scores
-            scores = {}
-            for pidx, pval in enumerate(vec_part):
-                for k, traj in enumerate(vec_traj):
-                    if is_valid_part(pval):
-                        s, _ = self.rapport_detection(int(traj), t, lest, int(pval), wn)
-                    else:
-                        s = -np.inf
-                    scores[(k, pidx)] = float(s)
-            for k in range(nb_traj):
-                best_pidx = None
-                best_s = -np.inf
-                for pidx, pval in enumerate(vec_part):
-                    if pidx in assigned:
-                        continue
-                    s = scores.get((k, pidx), -np.inf)
-                    if s > best_s:
-                        best_s = s
-                        best_pidx = pidx
-                if best_pidx is None:
-                    assignment[k] = -1
-                else:
-                    assignment[k] = int(vec_part[best_pidx])
-                    assigned.add(best_pidx)
-            return assignment[0]
+        # MATLAB evaluates perms(vec_part) exhaustively.  Iterating only the
+        # prefixes of that permutation matrix gives the same assignments while
+        # avoiding duplicate work on unused suffixes.
+        for perm in itertools.permutations(vec_part, r=nb_traj):
+            perm = np.asarray(perm)
+            vrais_tmp = self.vrais_config_reconnex(vec_traj, perm, t, lest, wn)
+            if vrais_tmp > vrais:
+                vrais = vrais_tmp
+                best_part = int(perm[0])
+        return best_part
 
     def vrais_config_reconnex(self, vec_traj, vec_part, t, lest, wn):
         vec_traj = np.asarray(vec_traj, dtype=int).ravel()
@@ -9229,355 +7683,7 @@ class SlimFastApp:
 
 
     #####tracking结束后，extra开始
-    def render_movie(self):
-        """
-        实现 monoView 模式下 Movie 分支：
-          - 计算第一帧加载参数（基于累积检测数）
-          - 调用数据预处理与渲染函数生成电影帧
-          - 对每一帧进行后处理（添加色图、比例尺、时间戳）
-          - 使用 imageio 保存 AVI 电影文件
-          - 同时在 SLIMfast Data Viewer 窗口中创建预览，显示电影投影，
-            并在图上绘制对角线和提示文本
-        返回：
-          preview_fig: 预览窗口的句柄
-        """
-        # 提示用户确认生成电影
-        if not messagebox.askyesno("Movie Preview", "是否确认电影设置并生成电影？"):
-            return
 
-        # 弹出保存对话框选择 AVI 文件保存路径
-        movie_path = filedialog.asksaveasfilename(defaultextension=".avi", title="保存电影为")
-        if not movie_path:
-            return
-
-        # 从 self.image_bin 中读取电影参数
-        fps = self.image_bin.get('fps', 10)
-        r_start = self.image_bin.get('r_start', 1)
-        r_end = int(self.image_bin['r_end'])
-        rW = self.image_bin.get('rW', 20)  # 数据窗口大小
-        rStep = self.image_bin.get('rStep', 1)
-
-        # 计算电影帧数，至少 1 帧
-        movie_frames = max(int(np.ceil((r_end - r_start + 1 - rW) / rStep)), 1)
-
-        # 创建视频写入器
-        writer = imageio.get_writer(movie_path, fps=fps, format='ffmpeg')
-
-        # 计算累积检测数数组 idx, 模拟 MATLAB 中的 [-1; cumsum(ctrsN)]
-        ctrsN = np.array(self.image_bin['ctrsN'])
-        idx = np.concatenate(([-1], np.cumsum(ctrsN)))
-
-        # 根据转换模式设置返回标志向量（此处未做后续处理，仅保留原逻辑）
-        conv_mode = self.image_bin['conv_mode']
-        if conv_mode == 1:
-            return_val = [1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]
-        else:
-            return_val = [1, 1, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0]
-
-        # 循环生成每一帧
-        first_frame = None  # 用来存储第一帧图像
-        #这里改成100,原来是movie_frames+1
-        for movie_frame in tqdm(range(1, movie_frames+1), desc="生成电影帧"):
-            # 计算当前帧加载参数
-            if movie_frame == 1:
-                self.image_bin['startPnt'] = idx[r_start] + 1
-                self.image_bin['elements'] = idx[r_start + rW] - max(1, self.image_bin['startPnt']) + 1
-            elif movie_frame == movie_frames:
-                if self.image_bin.get('is_cumsum', False):
-                    self.image_bin['startPnt'] = idx[r_start] + 1
-                else:
-                    self.image_bin['startPnt'] = idx[r_start + (movie_frames - 1) * rStep] + 1
-                self.image_bin['elements'] = idx[r_end] - self.image_bin['startPnt'] + 1
-            else:
-                if self.image_bin.get('is_cumsum', False):
-                    self.image_bin['startPnt'] = idx[r_start] + 1
-                else:
-                    self.image_bin['startPnt'] = idx[r_start + (movie_frame - 1) * rStep] + 1
-                self.image_bin['elements'] = idx[r_start + (movie_frame - 1) * rStep + rW] - self.image_bin[
-                    'startPnt'] + 1
-
-            # 计算当前帧在全局数据中的起始和结束索引（转换为0-based）
-            start_idx = self.image_bin['startPnt'] - 1
-            end_idx = start_idx + self.image_bin['elements']
-
-            # 构造当前帧的数据字典，只包括这一帧的粒子数据
-            data = {
-                'ctrsX': self.image_bin['ctrsX'][start_idx:end_idx],
-                'ctrsY': self.image_bin['ctrsY'][start_idx:end_idx],
-                'photons': self.image_bin['photons'][start_idx:end_idx],
-                'precision': self.image_bin['precision'][start_idx:end_idx]
-            }
-            # 固定 ROI 为 [0, 0, 320, 320]
-            roi_fixed = [0, 0, 320, 320]
-
-            # 调用渲染函数生成当前帧图像
-            frame_img, new_width, new_height, N = self.render_image(
-                data, roi_fixed,
-                self.image_bin['exf_new'],
-                self.image_bin['width'],
-                self.image_bin['height'],
-                self.image_bin['int_weight'],
-                self.image_bin['size_fac'],
-                self.image_bin['pxSize'],
-                conv_mode
-            )
-
-            # 如果是第一帧，保存下来用于合成预览图中下三角部分
-            if movie_frame == 1:
-                first_frame = np.copy(frame_img)
-
-            # 后处理：添加色图、比例尺、时间戳
-            if self.image_bin.get('is_colormap', False):
-                frame_img = self.imprint_colormap(frame_img, new_width, self.image_bin.get('colormapWidth'), 1)
-            if self.image_bin.get('is_scalebar', False):
-                frame_img = self.imprint_scalebar(
-                    frame_img, new_width, new_height,
-                    self.image_bin['exf_new'],
-                    self.image_bin.get('micron_bar_length'),
-                    self.image_bin['pxSize'],
-                    self.image_bin.get('timestampSize'),
-                    1
-                )
-            if self.image_bin.get('is_timestamp', False):
-                # 当前 movie_frame 乘以 timestampInkrement 作为时间值
-                timestamp = movie_frame * self.image_bin.get('timestampInkrement', 1)
-                frame_img = self.imprint_timestamp(
-                    frame_img, new_width, new_height,
-                    timestamp,
-                    self.image_bin.get('timestampSize'),
-                    1
-                )
-
-            # 写入当前帧到视频文件
-            writer.append_data(np.real(frame_img).astype(np.uint8))
-
-        writer.close()
-        messagebox.showinfo("Success", f"电影已成功保存：{movie_path}")
-
-        # 生成第一帧（Frame 1）的图像预览
-        # 假设在循环中我们保存了第一帧至 first_frame（需要在 movie_frame == 1 时保存）
-        first_frame_disp = np.real(first_frame).copy()  # Frame 1
-
-        # 生成累积图（Accumulate Frame），使用所有粒子的坐标进行渲染
-        # 构造数据字典，包含全局所有粒子的 x, y, photons, precision
-        data_all = {
-            'ctrsX': self.image_bin['ctrsX'],
-            'ctrsY': self.image_bin['ctrsY'],
-            'photons': self.image_bin['photons'],
-            'precision': self.image_bin['precision']
-        }
-        # 固定 ROI 为 [0, 0, 320, 320]（请根据实际情况修改）
-        roi_fixed = [0, 0, 320, 320]
-        # 这里传入其它参数与之前一致，conv_mode 应该已定义
-        accumulate_frame, new_width, new_height, N_all = self.render_image(
-            data_all, roi_fixed,
-            self.image_bin['exf_new'],
-            self.image_bin['width'],
-            self.image_bin['height'],
-            self.image_bin['int_weight'],
-            self.image_bin['size_fac'],
-            self.image_bin['pxSize'],
-            conv_mode
-        )
-        accumulate_frame = np.real(accumulate_frame).copy()
-
-        # 假设 first_frame 已在电影帧循环中保存（第一帧图像），
-        # 并且 accumulate_frame 已使用全部粒子数据进行渲染获得（最后一帧）
-        first_frame_uint8 = np.real(first_frame).astype(np.uint8)
-        accumulate_frame_uint8 = np.real(accumulate_frame).astype(np.uint8)
-
-        # 合成预览图像：上三角（包括主对角线）使用第一帧数据， 下三角使用累积数据（不包含主对角线）
-        composite = np.triu(accumulate_frame_uint8) + np.tril(first_frame_uint8, k=-1)
-
-        # 创建预览窗口
-        preview_fig = tk.Toplevel(self.master)
-        preview_fig.title("Movie Preview")
-        preview_fig.geometry("800x600")
-
-        fig_movie = plt.Figure(figsize=(8, 6))
-        ax_movie = fig_movie.add_subplot(111)
-        ax_movie.imshow(composite)
-
-        # 绘制主对角线，从左上 (0,0) 到右下 (new_width-1, new_height-1)
-        ax_movie.plot([0, new_width - 1], [0, new_height - 1], color='white', linewidth=3)
-
-        # 计算上三角区域（Frame 1）的质心
-        # 上三角包括所有满足 i <= j 的像素，质心可以近似取三个顶点的平均值
-        # 取顶点为：左上 (0,0), 右上 (new_width-1, 0), 右下 (new_width-1, new_height-1)
-        x_frame1 = (0 + (new_width - 1) + (new_width - 1)) / 3.0  # = 2*(new_width - 1)/3
-        y_frame1 = (0 + 0 + (new_height - 1)) / 3.0  # = (new_height - 1)/3
-
-        # 计算下三角区域（Accumulate）的质心
-        # 下三角包括所有满足 i > j 的像素，取顶点为：左上 (0,0), 左下 (0, new_height-1), 右下 (new_width-1, new_height-1)
-        x_accum = (0 + 0 + (new_width - 1)) / 3.0  # = (new_width - 1)/3
-        y_accum = (0 + (new_height - 1) + (new_height - 1)) / 3.0  # = 2*(new_height - 1)/3
-
-        # 在对应区域添加文本标签，调整位置使其远离主对角线
-        ax_movie.text(x_frame1, y_frame1, 'Accumulate', fontsize=15, color='white',
-                      ha='center', va='center')
-        ax_movie.text(x_accum, y_accum, 'Frame 1', fontsize=15, color='white',
-                      ha='center', va='center')
-
-        ax_movie.axis('off')
-
-        canvas_movie = FigureCanvasTkAgg(fig_movie, master=preview_fig)
-        canvas_movie.draw()
-        canvas_movie.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        preview_fig.deiconify()
-
-        return preview_fig
-
-    def export_three_snapshots(self):
-        """
-        生成三张静态图（300 dpi）：
-          1) first_frame.png  —— 第一帧窗口渲染
-          2) accumulate.png   —— 累积渲染（全体粒子）
-          3) composite_tri.png—— 上三角=累积，下三角=第一帧（无标注文字）
-        """
-        import numpy as np
-        import matplotlib.pyplot as plt
-        from pathlib import Path
-
-        # -------- 1) 固定输出目录 --------
-        out_dir = Path(r"C:\Users\asus\OneDrive\图片\Saved Pictures")
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        # -------- 2) 读取必要参数 --------
-        r_start = int(self.image_bin.get('r_start', 1))
-        r_end = int(self.image_bin['r_end'])
-        rW = int(self.image_bin.get('rW', 20))
-        rStep = int(self.image_bin.get('rStep', 1))
-        conv_mode = int(self.image_bin.get('conv_mode', 1))
-
-        exf_new = self.image_bin['exf_new']
-        width = self.image_bin['width']
-        height = self.image_bin['height']
-        int_weight = self.image_bin['int_weight']
-        size_fac = self.image_bin['size_fac']
-        pxSize = self.image_bin['pxSize']
-
-        roi_fixed = [0, 0, width, height]
-
-        # -------- 3) 索引准备 --------
-        ctrsN = np.asarray(self.image_bin['ctrsN'], dtype=int)
-        idx = np.concatenate(([-1], np.cumsum(ctrsN)))
-
-        # -------- 4) 第一帧窗口数据范围 --------
-        startPnt = idx[r_start] + 1
-        elements = idx[r_start + rW] - max(1, startPnt) + 1
-        s0 = int(startPnt - 1)
-        e0 = int(s0 + elements)
-
-        data_first = {
-            'ctrsX': self.image_bin['ctrsX'][s0:e0],
-            'ctrsY': self.image_bin['ctrsY'][s0:e0],
-            'photons': self.image_bin['photons'][s0:e0],
-            'precision': self.image_bin['precision'][s0:e0],
-        }
-
-        # -------- 5) 渲染第一帧 --------
-        frame_first, new_w, new_h, _ = self.render_image(
-            data_first, roi_fixed, exf_new, width, height,
-            int_weight, size_fac, pxSize, conv_mode
-        )
-        first_u8 = np.real(frame_first).astype(np.uint8)
-
-        # -------- 6) 渲染累计图 --------
-        data_all = {
-            'ctrsX': self.image_bin['ctrsX'],
-            'ctrsY': self.image_bin['ctrsY'],
-            'photons': self.image_bin['photons'],
-            'precision': self.image_bin['precision'],
-        }
-        frame_acc, _, _, _ = self.render_image(
-            data_all, roi_fixed, exf_new, width, height,
-            int_weight, size_fac, pxSize, conv_mode
-        )
-        acc_u8 = np.real(frame_acc).astype(np.uint8)
-
-        # -------- 7) 对齐尺寸并合成三角图 --------
-        H = min(first_u8.shape[0], acc_u8.shape[0])
-        W = min(first_u8.shape[1], acc_u8.shape[1])
-        first_u8 = first_u8[:H, :W]
-        acc_u8 = acc_u8[:H, :W]
-        composite = np.triu(acc_u8) + np.tril(first_u8, k=-1)
-
-        # -------- 8) 保存三张 PNG（300 dpi） --------
-        def save_fig(img, path):
-            fig, ax = plt.subplots(figsize=(W / 100, H / 100), dpi=300)
-            ax.imshow(img, cmap='gray')
-            ax.axis('off')
-            plt.subplots_adjust(0, 0, 1, 1)
-            fig.savefig(path, dpi=300, bbox_inches='tight', pad_inches=0)
-            plt.close(fig)
-
-        p1 = out_dir / "first_frame.png"
-        p2 = out_dir / "accumulate.png"
-        p3 = out_dir / "composite_tri.png"
-
-        save_fig(first_u8, p1)
-        save_fig(acc_u8, p2)
-        save_fig(composite, p3)
-
-        print(f" Saved 300 dpi images to: {out_dir}")
-        print(f"  ├─ {p1.name}")
-        print(f"  ├─ {p2.name}")
-        print(f"  └─ {p3.name}")
-
-    def imprint_colormap(self, I, width, mapHeight, mode):
-        """
-        在图像 I 的最后 mapHeight 行叠加颜色条，用于显示色图。
-
-        参数：
-          I: 输入图像（如果 mode==1，则为二维灰度图像；否则为三通道彩色图像，
-             其形状为 (height, width) 或 (height, width, 3)）
-          width: 图像宽度（用于生成色条）
-          mapHeight: 色条的高度（像素）
-          mode: 模式标志
-                - mode == 1：生成二维色条，并将其替换 I 的最后 mapHeight 行；
-                - mode == 3：生成三通道色条，其中第三个通道是一个垂直渐变；
-                - 其他模式：生成三通道色条，第三通道全为 0。
-
-        返回：
-          修改后的图像 I
-        """
-        if mode == 1:
-            # 生成从 0 到 255 的等间隔数列（长度为 width），并复制 mapHeight 行
-            ramp = np.round(np.linspace(0, 255, width)).astype(np.uint8)
-            colorRamp = np.tile(ramp, (mapHeight, 1))  # shape: (mapHeight, width)
-            # 替换图像 I 最后 mapHeight 行（假定 I 为二维数组）
-            I[-mapHeight:, :] = colorRamp
-        else:
-            # 计算 cmapWidth = floor(width/4)
-            cmapWidth = int(np.floor(width / 4))
-            # 生成色条一部分：从 0 到 255 的等间隔数列，长度为 cmapWidth
-            ramp = np.round(np.linspace(0, 255, cmapWidth)).astype(np.uint8)
-            # 生成一个全255的向量，长度为 cmapWidth
-            ones_255 = np.full((cmapWidth,), 255, dtype=np.uint8)
-            # 反转 ramp
-            ramp_flipped = np.flip(ramp)
-            # 生成长度为 (width - 3*cmapWidth) 的零向量
-            zeros_vec = np.zeros((width - 3 * cmapWidth,), dtype=np.uint8)
-            # 拼接得到一行色条
-            row_vec = np.concatenate([ramp, ones_255, ramp_flipped, zeros_vec])
-            # 复制 mapHeight 行，形成二维色条
-            colorRamp = np.tile(row_vec, (mapHeight, 1))
-
-            if mode == 3:
-                # 生成垂直渐变：从 0 到 255 的等间隔数列，长度为 mapHeight，转置为列向量
-                ramp_vertical = np.round(np.linspace(0, 255, mapHeight)).astype(np.uint8).reshape((mapHeight, 1))
-                # 水平复制，得到与色条相同尺寸的矩阵
-                colorRamp3D = np.tile(ramp_vertical, (1, width))
-                # 生成 3 通道色条：第一通道为 colorRamp，第二通道为 np.fliplr(colorRamp)，第三通道为 colorRamp3D
-                new_patch = np.dstack((colorRamp, np.fliplr(colorRamp), colorRamp3D))
-            else:
-                # 其他模式：第三通道全为 0
-                new_patch = np.dstack((colorRamp, np.fliplr(colorRamp), np.zeros_like(colorRamp, dtype=np.uint8)))
-
-            # 替换图像 I 最后 mapHeight 行（假定 I 为三通道数组）
-            I[-mapHeight:, :, :] = new_patch
-
-        return I
 
 
     def show_help(self):
@@ -9660,7 +7766,7 @@ class SlimFastApp:
 
         var_list = var_mapping.get(mode, [])
         if not var_list:
-            raise ValueError(f"无效的传输模式: {mode}")
+            raise ValueError(f"Invalid transfer mode: {mode}")
 
         # 根据模式处理传输逻辑
         if mode == 'render-mono':
@@ -9702,7 +7808,7 @@ class SlimFastApp:
             converted_value = self.convert_value_type(answer, values)
             target_window.image_data[param_name] = converted_value
         except (ValueError, TypeError):
-            self.show_error("无效的输入值")
+            self.show_error("Invalid input value")
 
     def convert_value_type(self, value, examples):
         """根据示例值类型转换输入值"""
@@ -9741,8 +7847,11 @@ class SlimFastApp:
         try:
             with open(file_path, 'w') as fid:
                 # 写入基础信息
-                fid.write(f"Filename: {self.image_bin.get('pathname', '')}"
-                          f"{self.image_bin.get('filename', '')}.mat\n")
+                source_name = os.path.join(
+                    self.image_bin.get('pathname', ''),
+                    self.image_bin.get('filename', '')
+                )
+                fid.write(f"Filename: {source_name}\n")
 
                 # 处理图像名称
                 if self.image_bin.get('isSuperstack', False):
@@ -9802,7 +7911,7 @@ class SlimFastApp:
                 self._write_range(fid, 'Filter Range =', 'minSNR', 'maxSNR', (0, 100))
 
         except Exception as e:
-            tk.messagebox.showerror("保存错误", f"文件保存失败: {str(e)}")
+            tk.messagebox.showerror("Save Error", f"Failed to save file: {str(e)}")
 
     def _write_param(self, fid, label, key, default):
         """写入单个参数"""
@@ -10386,8 +8495,8 @@ class SlimFastApp:
 
             # 弹出覆盖确认对话框
             answer = messagebox.askyesno(
-                title='警告',
-                message='是否覆盖已存在的文件?',
+                title='Warning',
+                message='Overwrite existing file?',
                 icon='warning',
                 default='no'
             )
@@ -10400,7 +8509,7 @@ class SlimFastApp:
                     try:
                         os.remove(fpath)
                     except Exception as e:
-                        warnings.warn(f"文件删除失败: {str(e)}")
+                        warnings.warn(f"Failed to delete file: {str(e)}")
 
                 # 更新搜索路径
                 self.image_bin['search_path'] = pathname
@@ -10420,7 +8529,7 @@ class SlimFastApp:
                     new_path = filedialog.asksaveasfilename(
                         initialfile=filename,
                         initialdir=self.image_bin.get('search_path', pathname),
-                        title="另存为"
+                        title="Save As"
                     )
                     dlg_root.destroy()
 
@@ -10449,21 +8558,10 @@ class SlimFastApp:
 
         # 创建 Text 小部件来显示 credits 信息
         credits_text = (
-            "Particle Localization:\n"
-            "© A. Serge, N. Bertaux,\n"
-            "H. Rigneault & D. Marguet\n"
-            "Dynamic multiple-target tracing\n"
-            "to probe spatiotemporal\n"
-            "cartography of cell membranes\n"
-            "Nature Methods, Aug. 08\n\n"
-            "Dynamic Convolution:\n"
-            "M. Parent, T. Gould,\n"
-            "S.T. Hess\n\n"
-            "kd-Tree & k-NN Search:\n"
-            "A. Tagliasacchi\n\n"
-            "written by C.P. Richter\n"
-            "Division of Biophysics / Group Piehler\n"
-            "University of Osnabrueck"
+            "One-Stop SPT\n\n"
+            "Developed by:\n"
+            "Shasha Liao, Xin Yang, Jinhong Wang,\n"
+            "Hongni Zhu, Yi Song, Yajie Liu, and Peng Dong"
         )
 
         text_widget = tk.Text(credits_window, wrap=tk.WORD, font=("Times New Roman", 12), bg="#f4f4f4", padx=10, pady=10,
@@ -10492,13 +8590,15 @@ class SlimFastApp:
                                  height=20, width=60)
         changelog_text.insert(tk.END, "\n".join([
             "v1.0.0 - Initial Release",
-            "    Integrated complete workflow: Imaging - then - Localization - then - Tracking - then - Analysis",
-            "    GUI-based batch processing for .tif image stacks",
-            "    Localization module with drift correction and photon count conversion",
-            "    Trajectory reconstruction with support for confined and directed motion types",
-            "    Built-in 2D/3D scatterplots, MSD, and jump length visualization",
-            "    Exportable results compatible with SLIMfast and ISBI formats",
-            "    User-friendly ROI control and frame navigation"
+            "",
+            "    Integrated workflow for localization, tracking, segmentation, and analysis",
+            "    Batch localization of TIFF image stacks",
+            "    MTT-based trajectory reconstruction",
+            "    MaU-Net nuclear segmentation and ROI filtering",
+            "    Spot-On kinetic-model fitting",
+            "    Radius of Confinement analysis",
+            "    Motion-state classification",
+            "    2D/3D visualization and data export"
         ]))
         changelog_text.config(state=tk.DISABLED)  # 禁用编辑
 
@@ -10511,6 +8611,67 @@ class SlimFastApp:
 
         changelog_window.resizable(False, False)
 
+
+
+def _safe_load_tiff(path):
+    """加载 TIFF 为 (frames, height, width) 灰度 stack，处理 RGB/RGBA 与单帧边界。"""
+    def rgb_to_gray(a):
+        rgb = a[..., :3].astype(np.float64, copy=False)
+        return (
+            0.2989 * rgb[..., 0]
+            + 0.5870 * rgb[..., 1]
+            + 0.1140 * rgb[..., 2]
+        )
+
+    with tifffile.TiffFile(path) as tif:
+        comp = tif.pages[0].compression
+        comp_name = comp.name if hasattr(comp, 'name') else str(comp)
+        n_pages = len(tif.pages)
+        print(f"Compression: {comp_name}  | pages={n_pages}")
+        try:
+            arr = tif.asarray()  # 保证页数正确
+        except Exception as e:
+            print(f"[warn] tif.asarray failed: {e}; fallback to imread")
+            arr = tifffile.imread(path)
+
+    if arr.ndim == 2:
+        stack = arr[np.newaxis, ...]
+    elif arr.ndim == 3:
+        # Single-page RGB/RGBA TIFFs are read as (height, width, channels).
+        # Localization expects (frames, height, width), so convert to one
+        # grayscale frame instead of mistaking channels for image width.
+        if arr.shape[-1] in (3, 4) and n_pages == 1:
+            stack = rgb_to_gray(arr)[np.newaxis, ...]
+        elif arr.shape[0] == n_pages:
+            stack = arr
+        elif arr.shape[-1] == n_pages and n_pages > 1:
+            stack = np.moveaxis(arr, -1, 0)
+        else:
+            k = [i for i, s in enumerate(arr.shape) if s == n_pages]
+            stack = np.moveaxis(arr, k[0], 0) if k else arr
+    elif arr.ndim >= 4:
+        # Common multi-page RGB/RGBA layout: (frames, height, width, channels).
+        if arr.shape[-1] in (3, 4):
+            stack = rgb_to_gray(arr)
+            if stack.ndim == 2:
+                stack = stack[np.newaxis, ...]
+        else:
+            if arr.shape[0] == n_pages:
+                stack = arr
+            elif arr.shape[-1] == n_pages and n_pages > 1:
+                stack = np.moveaxis(arr, -1, 0)
+            else:
+                k = [i for i, s in enumerate(arr.shape) if s == n_pages]
+                stack = np.moveaxis(arr, k[0], 0) if k else arr
+            while stack.ndim > 3:
+                stack = stack[:, :, :, 0]  # 丢多余通道
+    else:
+        raise RuntimeError(f"Unsupported TIFF shape: {arr.shape}")
+
+    if stack.ndim != 3:
+        raise RuntimeError(f"Unsupported TIFF stack shape after loading: {stack.shape}")
+
+    return stack
 
 
 def detect_et_estime_part_1vue_deflt(input_data, wn, r0, pfa, n_deflt, w, h, minInt, optim, ctx=None):
@@ -10618,16 +8779,21 @@ def detect_et_estime_part_1vue(input_data, wn, r0, pfa, optim, ctx=None):
 
 def carte_H0H1_1vue(im, rayon, wn_x, wn_y, s_pfa, ctx=None):
     """Detection map generation with debug prints."""
-    if ctx is not None:
-        TFHM, TFHGC, SGC2 = ctx
-
     im = np.asarray(im, dtype=np.float64)
     H, W = im.shape
+    T = int(wn_x) * int(wn_y)
+
     if ctx is not None:
         TFHM, TFHGC, SGC2 = ctx
         if TFHM.shape != (H, W) or TFHGC.shape != (H, W):
             raise RuntimeError("FFT kernels & image shape mismatch")
-    T = int(wn_x) * int(wn_y)
+    else:
+        # ctx 未提供时（例如 LOC TEST 的 show_loc_preview），就地计算 FFT 核
+        TFHM = fft2(expand_w(np.ones((int(wn_x), int(wn_y))), H, W))
+        g = gausswin2(rayon, int(wn_x), int(wn_y))
+        gc = g - np.sum(g) / T
+        SGC2 = np.sum(gc ** 2)
+        TFHGC = fft2(expand_w(gc, H, W))
 
     # 2.1 图像 FFT
     tfim = fft2(im)
