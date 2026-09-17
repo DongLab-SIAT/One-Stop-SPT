@@ -184,19 +184,6 @@ The notebook calls the current `SPTpy.py` Spot-On and motion-classification meth
 
 The example uses **precomputed trajectories**, not the complete raw TIFF stack. It does not rerun localization or MTT linking. Filtering existing trajectories after segmentation differs from filtering localizations before tracking in the GUI; demo results need not equal the full manuscript analysis.
 
-### Required demo inputs
-
-Place these files in `test_data/` before running the notebook:
-
-- `MaU-Net.pth`
-- `SMI-293T-CREB-1-JF549_2D_561nm_200mw_10ms_active_64_pos1.png`
-- `SMI-293T-CREB-1-JF549_2D_561nm_200mw_10ms_active_64_pos1_locs.txt`
-- `SMI-293T-CREB-1-JF549_2D_561nm_200mw_10ms_active_64.png`
-- `SMI-293T-CREB-1-JF549_2D_561nm_200mw_10ms_active_64_scatter_plot.png`
-- `SMI-293T-CREB-1-JF549_2D_561nm_200mw_10ms_active_64_pos1_table.txt`
-
-Large datasets and model weights may need to be obtained separately; do not assume they are included in every checkout. The notebook reports missing inputs before starting analysis.
-
 ## **7. Example Datasets**
 
 ### **Figshare Archive**
