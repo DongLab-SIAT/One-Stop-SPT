@@ -207,6 +207,8 @@ The datasets used in the manuscript have been deposited on Figshare:
 
 The archive includes **two raw microscopy TIFF stacks**, localization and trajectory data, and MaU-Net segmentation datasets and model weights for live-cell single-particle tracking analysis.
 
+The two raw microscopy TIFF stacks are hosted on Figshare because they exceed GitHub’s per-file size limit: https://doi.org/10.6084/m9.figshare.33842287
+
 ---
 
 ## **8. Citation**
