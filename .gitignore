@@ -42,13 +42,23 @@ Thumbs.db
 
 # Project specific
 *.mat
+!SPTpy/MonteCarloParams_1_gap.mat
 *.log
 *.tmp
+*.pth
+*.pt
+*_locs.txt
+*_table.txt
+*_seg.npy
+*.sources.json
 
-# Data files (uncomment if you have large data files)
-# data/
-# *.tif
-# *.tiff
+# Experimental data and generated output
+test_data/
+data/
+*.tif
+*.tiff
+/*.png
+/C:*/
 
 .venv/
 __pycache__/
@@ -59,6 +69,3 @@ __pycache__/
 
 
 .git_backup_old/
-!SPTpy/MonteCarloParams_1_gap.mat
-*.tif
-*.tiff
